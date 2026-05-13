@@ -307,9 +307,12 @@ The common loss is quantile loss:
 \end{aligned}
 ```
 
-This has a different modeling flavor from DeepAR. DeepAR defines a parametric distribution such as negative binomial. TFT with quantile loss directly learns selected points of the conditional predictive distribution. For a competition point forecast, the median or mean-like postprocessing can be used, but mathematically the training objective is not the same as a count likelihood.
+This has a different modeling flavor from DeepAR. DeepAR defines a parametric distribution such as the **negative binomial**. TFT, trained with **quantile loss**, directly learns selected points of the conditional predictive distribution. For a competition-style point forecast, the median or a mean-like postprocessing step can be used, but mathematically the training objective is different from a count-based likelihood.
 
-TFT's main architectural advantage comes from how it processes variables before sequence modeling. For a set of input variables `j = 1, ..., m`, TFT uses variable selection networks. A simplified version is:
+Before selecting which covariates matter, each input variable is first transformed using a **Gated Residual Network (GRN)**. A GRN is **a small context-conditioned feed-forward block with residual connections and gating mechanisms** that can either amplify useful nonlinear transformations or suppress unnecessary ones. These GRNs are reused throughout the architecture, including variable selection, static enrichment, and temporal processing.
+
+The main architectural advantage of TFT comes from how variables are processed before sequence modeling. For a set of input variables `j = 1, \ldots, m`, the variable selection network can be written in simplified form as:
+
 
 ```math
 \begin{aligned}
