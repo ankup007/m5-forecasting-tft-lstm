@@ -330,7 +330,7 @@ a_t
 \end{aligned}
 ```
 
-The weights $\a_{j,t}$ are feature-selection weights. The important part for M5 is the `context`: static product/store information can influence which time-varying variables are emphasized. This gives TFT a more explicit mechanism for statements like:
+The weights $a_{j,t}$ are feature-selection weights. The important part for M5 is the `context`: static product/store information can influence which time-varying variables are emphasized. This gives TFT a more explicit mechanism for statements like:
 
 - price matters more for some departments than others;
 - SNAP matters more for some states and categories;
@@ -368,10 +368,13 @@ After variable selection, TFT still uses recurrent layers for local temporal pro
 \begin{aligned}
 u_t
 &=
-\operatorname{LSTM}_{\text{encoder}}(\tilde{x}_{T-C+1:T}) \\
+\mathrm{LSTM}_{enc}
+(\tilde{x}_{T-C+1:T}) \\
+
 v_h
 &=
-\operatorname{LSTM}_{\text{decoder}}(\tilde{x}_{T+1:T+H})
+\mathrm{LSTM}_{dec}
+(\tilde{x}_{T+1:T+H})
 \end{aligned}
 ```
 
@@ -380,17 +383,20 @@ Then static enrichment injects static context into the temporal representations:
 ```math
 r_t
 =
-\operatorname{GRN}([u_t \text{ or } v_t], c_s)
+\mathrm{GRN}(u_t, c_s)
 ```
 
-where `c_s` is a learned static context vector derived from `s_i`.
+where $c_s$ is a learned static context vector derived from $s_i$.
 
 Finally, TFT applies interpretable multi-head attention over temporal positions:
 
 ```math
-\operatorname{Attention}(Q, K, V)
+\mathrm{Attention}(Q,K,V)
 =
-\operatorname{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+\mathrm{softmax}
+\left(
+\frac{QK^\top}{\sqrt{d_k}}
+\right)V
 ```
 
 This allows each forecast horizon to weight relevant historical positions differently. For M5, day `T+7` might attend strongly to the same weekday last week, while day `T+28` might benefit more from four-week lag structure, nearby events, or holiday-adjacent behavior.
