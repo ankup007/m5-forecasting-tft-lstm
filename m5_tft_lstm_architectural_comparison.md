@@ -4,7 +4,7 @@
 
 The M5 Forecasting Accuracy competition is often described as a retail forecasting benchmark, but that description hides much of what makes the problem interesting. This is not just a collection of independent sales curves. It is a large, hierarchical, covariate-rich demand forecasting problem with thousands of sparse item-store time series, known future calendar information, prices, product metadata, store metadata, and a short 28-day forecast horizon.
 
-That combination makes model choice less obvious than it first appears. A Temporal Fusion Transformer (TFT) looks attractive because the dataset has exactly the kind of static and time-varying covariates TFT was designed to use. An LSTM-based approach such as DeepAR looks attractive for a different reason: it is simpler, global, probabilistic, and much more practical when 30,000+ related time series have to be trained on CPU.
+That combination makes model choice less obvious than it first appears. A **Temporal Fusion Transformer (TFT)** looks attractive because the dataset has exactly the kind of **static and time-varying covariates** TFT was designed to use. An LSTM-based approach such as DeepAR looks attractive for a different reason: it is simpler, global, probabilistic, and much more practical when 30,000+ related time series have to be trained on CPU.
 
 The useful question is therefore not simply "Is TFT better than LSTM?" A better question is:
 
