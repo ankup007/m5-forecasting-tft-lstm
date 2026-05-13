@@ -315,13 +315,15 @@ TFT's main architectural advantage comes from how it processes variables before 
 \begin{aligned}
 v_{j,t}
 &=
-\operatorname{GRN}_j(\operatorname{input}_{j,t}, \operatorname{context}) \\
+\mathrm{GRN}_j(x_{j,t}, c) \\
+
 a_t
 &=
-\operatorname{softmax}\left(
-\operatorname{GRN}_{\text{gate}}
-\left([\operatorname{input}_{1,t}, \ldots, \operatorname{input}_{m,t}], \operatorname{context}\right)
-\right) \\
+\mathrm{softmax}
+\Big(
+\mathrm{GRN}_{gate}(x_{1,t}, \ldots, x_{m,t}, c)
+\Big) \\
+
 \tilde{x}_t
 &=
 \sum_{j=1}^{m} a_{j,t} v_{j,t}
