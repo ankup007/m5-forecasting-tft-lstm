@@ -1,6 +1,6 @@
-# TFT vs LSTM/DeepAR for M5 Forecasting: Architecture, Data Fit, and Compute Reality
+# TFT vs DeepAR/LSTM for M5 Forecasting: Dataset Complexity, Architecture, and Compute Tradeoffs
 
-## Introduction
+## Framing the Choice
 
 The M5 Forecasting Accuracy competition is often described as a retail forecasting benchmark, but that description hides much of what makes the problem interesting. This is not just a collection of independent sales curves. It is a large, hierarchical, covariate-rich demand forecasting problem with thousands of sparse item-store time series, known future calendar information, prices, product metadata, store metadata, and a short 28-day forecast horizon.
 
@@ -17,7 +17,7 @@ The short answer:
 - **The deciding constraint is not only CPU vs GPU; it is the full compute budget: memory, window sampling, sequence length, feature count, training time, and iteration speed.**
 - **TFT becomes more attractive once that budget can support richer covariate handling, interpretability, and direct multi-horizon modeling.**
 
-## The M5 Dataset Is Not a Simple Time Series Dataset
+## M5 Dataset Complexity
 
 The M5 Accuracy competition asked participants to forecast Walmart daily unit sales for the next 28 days. The dataset contains 3,049 products sold across 10 stores in 3 US states. At the most granular level, this creates 30,490 item-store time series. Once the hierarchy is expanded, 42,840 series are evaluated across product, store, state, category, department, and aggregate levels. The M5 background paper describes the dataset as hierarchical, grouped, exogenous-variable-rich, and intermittent [Makridakis et al., 2022a](https://econpapers.repec.org/article/eeeintfor/v_3a38_3ay_3a2022_3ai_3a4_3ap_3a1325-1336.htm).
 
@@ -47,7 +47,7 @@ The scale becomes clearer when the data is reshaped into model-ready long format
 
 That scale is one of the reasons architecture cannot be discussed separately from compute.
 
-## The Modeling Problem Hidden Inside M5
+## Forecasting Challenges in M5
 
 M5 combines four different forecasting problems.
 
@@ -61,7 +61,7 @@ Fourth, there is **intermittent and sparse demand**. Many item-store series have
 
 These four requirements create the central tension: TFT is better designed for rich feature interaction and known future covariates, while DeepAR/LSTM is easier to train globally at M5 scale.
 
-## LSTM and DeepAR: The Practical Neural Baseline
+## DeepAR/LSTM as a Practical Neural Baseline
 
 DeepAR is the most relevant LSTM-based approach for this discussion. A plain LSTM trained separately for each series would be a poor fit for M5 because many series are sparse and noisy. DeepAR instead uses one global recurrent model trained across many related time series. This lets low-volume item-store pairs borrow statistical strength from similar products, stores, departments, categories, and states.
 
@@ -78,7 +78,7 @@ DeepAR is usually built from the following pieces:
 
 The DeepAR paper frames the model as probabilistic forecasting with autoregressive recurrent networks trained across large collections of related series [Salinas et al., 2020](https://econpapers.repec.org/article/eeeintfor/v_3a36_3ay_3a2020_3ai_3a3_3ap_3a1181-1191.htm), [arXiv version](https://arxiv.org/abs/1704.04110). This global design is the main reason it remains relevant for M5.
 
-### Why DeepAR Works Reasonably Well for M5
+### Strengths for M5
 
 DeepAR matches the scale of M5 better than a local LSTM. A single global model can be trained over all 30,490 bottom-level series, using static embeddings to distinguish item-store behavior. This is exactly the kind of setting where global recurrent forecasting tends to be useful.
 
@@ -88,7 +88,7 @@ DeepAR is also relatively compute-friendly. The dominant recurrent cost grows wi
 
 For a dataset with tens of millions of long-format rows, a model that can be trained, debugged, and iterated is often more valuable than a richer model that cannot be run at meaningful scale.
 
-### Where DeepAR Falls Short
+### Limitations
 
 DeepAR's weakness is that the model does not deeply structure the relationship between static metadata, observed history, and known future covariates. Calendar, SNAP, event, and price features can be passed into the model, but their relevance is learned implicitly through embeddings and recurrent states.
 
@@ -98,7 +98,7 @@ The second limitation is autoregressive decoding. DeepAR generates future values
 
 The third limitation is long-range memory. LSTMs are good at local temporal dynamics, but annual patterns or distant event analogs should usually be exposed through explicit lag features rather than relying on the recurrent state to remember hundreds of daily steps.
 
-### Practical DeepAR Shape for M5
+### Practical DeepAR Configuration
 
 A sensible first DeepAR setup would be deliberately compact:
 
@@ -117,7 +117,7 @@ A sensible first DeepAR setup would be deliberately compact:
 
 The key idea is to keep the recurrent model small, use strong feature construction, and rely on global learning.
 
-## Temporal Fusion Transformer: The Architecturally Natural Fit
+## TFT as the Natural Architectural Fit
 
 Temporal Fusion Transformer was designed for interpretable multi-horizon forecasting when static covariates, known future inputs, and observed historical inputs are all present [Lim et al., 2020](https://arxiv.org/abs/1912.09363). That description maps unusually well to M5.
 
@@ -144,7 +144,7 @@ TFT also combines several mechanisms:
 
 TFT is not simply a Transformer added to a time series. It is a hybrid architecture that keeps recurrent local processing while adding feature selection, static conditioning, known-future conditioning, gating, and attention.
 
-### Why TFT Fits M5
+### TFT Strengths for M5
 
 The strongest argument for TFT is known future covariates. Each of the 28 future days has a known weekday, calendar position, event state, SNAP flag, and possibly price context. TFT can condition each forecast step directly on these future values. This is cleaner than forcing the model to rely mainly on a recurrent state and a recursive path.
 
@@ -154,7 +154,7 @@ The third argument is interpretability. Variable selection weights and attention
 
 The fourth argument is direct multi-horizon modeling. TFT predicts the forecast horizon as a sequence of outputs rather than relying entirely on recursive generation. For a fixed 28-day horizon, this is attractive because each horizon position can be conditioned on its own known future inputs.
 
-### Where TFT Becomes Expensive
+### TFT Compute Cost
 
 TFT's problem is not conceptual fit. Its problem is operational cost.
 
@@ -175,7 +175,7 @@ This is the practical catch: the architecture that best matches the data can als
 
 For M5, a full TFT with a long encoder, many features, item-level embeddings, multiple attention heads, and all possible windows would be a poor first experiment under limited compute. It may be theoretically appealing, but it is unlikely to be the most efficient way to make progress.
 
-### Practical TFT Shape for M5
+### Practical TFT Configuration
 
 If TFT is used, it should start small:
 
@@ -194,7 +194,7 @@ If TFT is used, it should start small:
 
 The main principle is restraint. TFT should be introduced after the feature pipeline is stable, not before. Otherwise the model complexity can hide basic data issues.
 
-## The Math: DeepAR vs TFT
+## Mathematical Framing: DeepAR vs TFT
 
 The qualitative difference between DeepAR and TFT becomes clearer if the M5 task is written as a conditional forecasting problem.
 
@@ -214,7 +214,7 @@ p\left(y_{i,T+1:T+H} \mid y_{i,T-C+1:T}, x_{i,T-C+1:T+H}, s_i\right)
 
 The crucial detail is that `x` extends into the future for known covariates. Weekday, event, SNAP, and planned price features can be available for `T+1` through `T+28`, while future sales are not.
 
-### DeepAR as a Conditional Autoregressive Likelihood
+### DeepAR: Conditional Autoregressive Likelihood
 
 DeepAR factorizes the joint forecast distribution into one-step conditional distributions:
 
@@ -271,7 +271,7 @@ So errors can propagate through the forecast path. This is especially relevant f
 
 DeepAR's static conditioning is also mathematically simple. The static embedding `e_i` is usually concatenated into the recurrent input or used to initialize hidden states. That lets the LSTM learn product/store-specific behavior, but it does not explicitly ask which variables matter for which static context. The interaction is learned implicitly inside the recurrent state transition.
 
-### TFT as Direct Multi-Horizon Conditional Modeling
+### TFT: Direct Multi-Horizon Modeling
 
 TFT does not rely only on the autoregressive factorization above. It is designed to produce horizon-specific forecasts more directly:
 
@@ -415,7 +415,7 @@ O(Ld^2)
 
 depending on hidden size `d`. TFT also adds variable-selection and GRN costs that DeepAR does not have. This is why TFT's richer math creates operational friction under constrained compute.
 
-### What the Math Means for M5
+### Implications for M5
 
 The two models are not merely "LSTM versus Transformer." They make different assumptions about the forecasting distribution and the forecast path.
 
@@ -448,7 +448,7 @@ f_h(y_{\text{past}}, x_{\text{past}}, x_{\text{future}}, s)
 
 For M5, the more realistic staged path is to use DeepAR to establish the global probabilistic baseline, then use TFT when the feature pipeline, sampling strategy, and compute budget can support the extra mathematical machinery.
 
-## Architectural Comparison
+## Architecture Tradeoffs
 
 The difference between DeepAR and TFT can be summarized as follows:
 
@@ -467,7 +467,7 @@ The difference between DeepAR and TFT can be summarized as follows:
 
 This table is the practical summary: DeepAR is the easier operating point; TFT is the richer model.
 
-## Training and Compute Requirements
+## Compute and Training Requirements
 
 Both models require the same disciplined data foundation:
 
@@ -511,15 +511,56 @@ Several choices should be avoided regardless of architecture:
 - treating all zero sales as equivalent;
 - increasing neural depth before fixing the data pipeline.
 
-## Which Direction Makes More Sense?
+## Recommended Modeling Path
 
 The most defensible path is staged:
 
 | Stage | Direction | Reason |
 |---|---|---|
-| First neural model | DeepAR/LSTM | Establish a tractable global neural baseline across all 30K+ series |
-| Second-stage richer model | TFT | Exploit known future covariates, static conditioning, and interpretability |
+| Pilot comparison | DeepAR/LSTM and compact TFT on a representative subset | Compare architectures before paying the full-data training cost |
+| First full-data neural model | DeepAR/LSTM | Establish a tractable global neural baseline across all 30K+ series |
+| Second-stage richer model | TFT | Exploit known future covariates, static conditioning, and interpretability after the pipeline is stable |
 | Competition-style benchmark | LightGBM | Historical M5 evidence strongly supports feature-engineered tree models |
+
+### Pilot Subset Design
+
+The pilot should not be a random sample of rows. Time series models need complete histories, so the sample should select a manageable set of item-store series and keep their full time span, calendar joins, price joins, lags, and rolling features. A reasonable first comparison could use roughly 1,000 bottom-level item-store series, but the design matters more than the exact number.
+
+A good subset should be stratified across the structure of M5:
+
+| Sampling dimension | Design intent |
+|---|---|
+| Category and department | Include Foods, Household, and Hobbies, not only high-volume categories |
+| Store and state | Cover all 10 stores and all 3 states so SNAP and local effects remain visible |
+| Sales volume | Include high, medium, low, and near-zero demand series |
+| Intermittency | Include both stable sellers and sparse item-store pairs |
+| Price behavior | Include items with frequent price movement and items with stable prices |
+| Hierarchy coverage | Prefer coherent product-store slices so aggregate diagnostics still mean something |
+
+One practical design is to sample item-store series within each category-store or department-store cell, with weights that preserve a mix of volume and intermittency. Another is to select a smaller number of products across all stores, which keeps product-level behavior coherent and makes hierarchy-level checks cleaner. Either approach is better than taking arbitrary rows from the long table.
+
+The scale-up path can then be explicit:
+
+| Experiment size | Purpose |
+|---|---|
+| 500 to 1,000 item-store series | Validate feature pipeline, loss behavior, runtime, and rough model ranking |
+| 3,000 to 5,000 item-store series | Test whether the ranking survives broader category, store, and demand coverage |
+| All 30,490 bottom-level series | Train the full neural baseline only after the smaller runs are stable |
+
+### Controlled Model Comparison
+
+The pilot experiment should hold the comparison fixed:
+
+| Experiment control | Recommendation |
+|---|---|
+| Time split | Use the same validation horizon for both models, ideally one or more 28-day backtests |
+| Feature set | Use the same static, known future, observed, lag, and rolling features where applicable |
+| Context length | Start with the same 56 to 84 day encoder/context window |
+| Training budget | Compare under a fixed wall-clock or epoch budget, not only best possible accuracy |
+| Metrics | Track validation loss, WRMSSE-style accuracy, horizon-wise error, and error by volume/intermittency bucket |
+| Operational metrics | Record memory use, training time, inference time, and tuning sensitivity |
+
+The subset is not meant to produce the final leaderboard model. Its purpose is to answer practical questions early: whether TFT's richer covariate handling is visible on M5-like data, whether DeepAR's simpler global likelihood is already competitive, which features are actually useful, and how quickly each model becomes difficult to train. If TFT only wins on a small clean subset but is unstable or too slow as the sample expands, that is useful information before committing to a full 30K+ series run.
 
 **Move first toward DeepAR/LSTM when the goal is a full-data neural baseline under limited compute. Move toward TFT when the objective shifts toward richer covariate handling, interpretability, or a compute budget that can support heavier experimentation.**
 
