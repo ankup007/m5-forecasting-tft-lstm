@@ -203,11 +203,11 @@ The qualitative difference between DeepAR and TFT becomes clearer if the M5 task
 
 For item-store series `i`, let:
 
-- `y_{i,t}` be unit sales on day `t`;
-- `s_i` be static metadata such as item, department, category, store, and state;
-- `x_{i,t}` be time-varying covariates such as weekday, event flags, SNAP flags, price, lags, and rolling statistics;
-- `H = 28` be the forecast horizon;
-- `C` be the context length.
+- $y_{i,t}$ be unit sales on day $t$;
+- $s_i$ be static metadata such as item, department, category, store, and state;
+- $x_{i,t}$ be time-varying covariates such as weekday, event flags, SNAP flags, price, lags, and rolling statistics;
+- $H = 28$ be the forecast horizon;
+- $C$ be the context length.
 
 The model is trying to estimate:
 
