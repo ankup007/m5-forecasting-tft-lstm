@@ -147,7 +147,7 @@ TFT also combines several mechanisms:
 
 This is why TFT feels so relevant to M5. It is not simply a Transformer added to a time series. It is a hybrid architecture that keeps recurrent local processing while adding feature selection, static conditioning, known-future conditioning, gating, and attention.
 
-### Why TFT Fits M5 So Well
+### Why TFT Fits M5 
 
 The strongest argument for TFT is known future covariates. Each of the 28 future days has a known weekday, calendar position, event state, SNAP flag, and possibly price context. TFT can condition each forecast step directly on these future values. This is cleaner than forcing the model to rely mainly on a recurrent state and a recursive path.
 
@@ -211,8 +211,8 @@ For item-store series `i`, let:
 
 The model is trying to estimate:
 
-```math
-p\left(y_{i,T+1:T+H} \mid y_{i,T-C+1:T}, x_{i,T-C+1:T+H}, s_i\right)
+```markdown
+$$ p\left(y_{i,T+1:T+H} \mid y_{i,T-C+1:T}, x_{i,T-C+1:T+H}, s_i\right) $$
 ```
 
 The crucial detail is that `x` extends into the future for known covariates. Weekday, event, SNAP, and planned price features can be available for `T+1` through `T+28`, while future sales are not.
