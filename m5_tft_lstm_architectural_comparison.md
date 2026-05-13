@@ -246,8 +246,8 @@ For M5, the output distribution matters. Unit sales are non-negative counts, spa
 
 ```math
 \begin{aligned}
-y_{i,t} &\sim \operatorname{NegBin}(\mu_{i,t}, \alpha_{i,t}) \\
-\operatorname{Var}(y_{i,t}) &= \mu_{i,t} + \alpha_{i,t}\mu_{i,t}^{2}
+y_{i,t} &\sim \mathrm{NegBin}(\mu_{i,t}, \alpha_{i,t}) \\
+\mathrm{Var}(y_{i,t}) &= \mu_{i,t} + \alpha_{i,t}\mu_{i,t}^{2}
 \end{aligned}
 ```
 
