@@ -211,8 +211,8 @@ For item-store series `i`, let:
 
 The model is trying to estimate:
 
-```markdown
-$$ p\left(y_{i,T+1:T+H} \mid y_{i,T-C+1:T}, x_{i,T-C+1:T+H}, s_i\right) $$
+```math
+p\left(y_{i,T+1:T+H} \mid y_{i,T-C+1:T}, x_{i,T-C+1:T+H}, s_i\right)
 ```
 
 The crucial detail is that `x` extends into the future for known covariates. Weekday, event, SNAP, and planned price features can be available for `T+1` through `T+28`, while future sales are not.
