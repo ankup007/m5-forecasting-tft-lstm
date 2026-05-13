@@ -330,7 +330,7 @@ a_t
 \end{aligned}
 ```
 
-The weights `a_{j,t}` are feature-selection weights. The important part for M5 is the `context`: static product/store information can influence which time-varying variables are emphasized. This gives TFT a more explicit mechanism for statements like:
+The weights $\a_{j,t}$ are feature-selection weights. The important part for M5 is the `context`: static product/store information can influence which time-varying variables are emphasized. This gives TFT a more explicit mechanism for statements like:
 
 - price matters more for some departments than others;
 - SNAP matters more for some states and categories;
@@ -343,15 +343,20 @@ TFT also uses gated residual networks. A simplified GRN can be written as:
 
 ```math
 \begin{aligned}
-\operatorname{GRN}(a, c)
+\mathrm{GRN}(a,c)
 &=
-\operatorname{LayerNorm}\left(a + \operatorname{Gate}(\eta)\right) \\
+\mathrm{LayerNorm}
+\Big(
+a+\mathrm{Gate}(\eta)
+\Big) \\
+
 \eta
 &=
-W_2 \operatorname{ELU}(W_1 a + W_c c + b_1) + b_2 \\
-\operatorname{Gate}(\eta)
+W_2\,\mathrm{ELU}(W_1 a+W_c c+b_1)+b_2 \\
+
+\mathrm{Gate}(\eta)
 &=
-\sigma(W_g \eta) \odot W_s \eta
+\sigma(W_g\eta)\odot W_s\eta
 \end{aligned}
 ```
 
