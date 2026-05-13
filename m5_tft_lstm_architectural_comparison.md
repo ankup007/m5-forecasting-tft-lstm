@@ -251,14 +251,12 @@ y_{i,t} &\sim \mathrm{NegBin}(\mu_{i,t}, \alpha_{i,t}) \\
 \end{aligned}
 ```
 
-Here `mu` is the conditional mean and `alpha` controls overdispersion. This is useful for M5 because many item-store series have variance much larger than the mean. The model can learn that a high-volume food item and a low-volume hobby item should not have the same uncertainty structure.
+Here $\mu$ is the conditional mean and $\alpha$ controls overdispersion. This is useful for M5 because many item-store series have variance much larger than the mean. The model can learn that a high-volume food item and a low-volume hobby item should not have the same uncertainty structure.
 
 The training objective is negative log likelihood:
 
 ```math
-\mathcal{L}_{\text{DeepAR}}
-=
-- \sum_i \sum_t \log p(y_{i,t} \mid \theta_{i,t})
+\mathcal{L}_{\mathrm{DeepAR}} = - \sum_i \sum_t \log p(y_{i,t} \mid \theta_{i,t})
 ```
 
 If the likelihood is negative binomial, the loss rewards the model for assigning high probability to the observed count, not merely for getting close under squared error. This is one reason DeepAR can be a better neural baseline than a plain LSTM with an MSE head.
