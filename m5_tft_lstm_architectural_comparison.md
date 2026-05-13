@@ -234,11 +234,11 @@ A compact DeepAR recurrence can be written as:
 
 ```math
 \begin{aligned}
-e_i &= \operatorname{Embed}(s_i) \\
+e_i &= \mathrm{Embed}(s_i) \\
 z_{i,t} &= [y_{i,t-1}, x_{i,t}, e_i] \\
-h_{i,t} &= \operatorname{LSTM}(h_{i,t-1}, z_{i,t}) \\
+h_{i,t} &= \mathrm{LSTM}(h_{i,t-1}, z_{i,t}) \\
 \theta_{i,t} &= W_o h_{i,t} + b_o \\
-y_{i,t} &\sim \operatorname{Distribution}(\theta_{i,t})
+y_{i,t} &\sim \mathrm{Distribution}(\theta_{i,t})
 \end{aligned}
 ```
 
