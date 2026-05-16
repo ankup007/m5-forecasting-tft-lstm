@@ -1,0 +1,12 @@
+name: m5-deepar-scratch
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - cpuonly
+  - numpy
+  - pandas
+  - tqdm
+  - pyyaml

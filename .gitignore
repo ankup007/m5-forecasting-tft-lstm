@@ -25,6 +25,9 @@ dist/
 venv/
 env/
 
+# Model outputs
+artifacts/
+
 # Jupyter
 .ipynb_checkpoints/
 

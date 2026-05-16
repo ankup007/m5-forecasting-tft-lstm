@@ -38,6 +38,35 @@ Start with a representative pilot rather than immediately training both neural m
 
 The comparison should keep the validation horizon, feature set, context length, and training budget fixed across models. Track not only accuracy, but also memory use, training time, inference time, horizon-wise error, and error by demand bucket. This makes the final full-data direction an engineering decision rather than a guess based only on architectural appeal.
 
+## DeepAR From-Scratch Pipeline
+
+The repository includes a PyTorch-only DeepAR implementation under `src/deepar_m5`. It does not use forecasting libraries or built-in recurrent layers; the LSTM cell, negative-binomial likelihood, sampled training windows, training loop, and autoregressive inference are implemented directly.
+
+Create the isolated conda environment:
+
+```powershell
+conda env create -f environment.yml
+conda activate m5-deepar-scratch
+```
+
+Run a smoke test:
+
+```powershell
+python scripts\smoke_deepar_m5.py --subset-size 12 --context-length 28 --prediction-length 7 --device cpu
+```
+
+Train a pilot model:
+
+```powershell
+python scripts\train_deepar_m5.py --subset-size 1000 --context-length 56 --prediction-length 28 --batch-size 128 --epochs 10 --steps-per-epoch 200 --device auto
+```
+
+Generate a submission-shaped file:
+
+```powershell
+python scripts\predict_deepar_m5.py --checkpoint artifacts\deepar_m5\best.pt --output artifacts\deepar_m5\submission.csv --device auto
+```
+
 ## References
 
 This analysis references foundational papers including:
