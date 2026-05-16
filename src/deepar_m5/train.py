@@ -13,6 +13,8 @@ from .model import DeepAR, ModelConfig, negative_binomial_nll
 
 
 def batch_to_torch(batch: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
+    """Move a NumPy batch produced by ``WindowSampler`` onto a PyTorch device."""
+
     return {
         "target": torch.as_tensor(batch["target"], dtype=torch.float32, device=device),
         "covariates": torch.as_tensor(batch["covariates"], dtype=torch.float32, device=device),
@@ -23,12 +25,16 @@ def batch_to_torch(batch: dict[str, np.ndarray], device: torch.device) -> dict[s
 
 
 def choose_device(device_arg: str) -> torch.device:
+    """Resolve ``auto`` to CUDA when available, otherwise return the requested device."""
+
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_arg)
 
 
 def evaluate(model: DeepAR, sampler: WindowSampler, batch_size: int, device: torch.device) -> float:
+    """Evaluate masked validation NLL over deterministic holdout windows."""
+
     model.eval()
     total_loss = 0.0
     total_weight = 0.0
@@ -53,6 +59,8 @@ def save_checkpoint(
     best_val_loss: float,
     train_args: argparse.Namespace,
 ) -> None:
+    """Persist model weights plus all metadata needed for reproducible inference."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -72,6 +80,8 @@ def save_checkpoint(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Define CLI arguments for DeepAR training runs."""
+
     parser = argparse.ArgumentParser(description="Train a from-scratch DeepAR model on M5 data.")
     parser.add_argument("--data-dir", default="m5-forecasting-accuracy")
     parser.add_argument("--artifact-dir", default="artifacts/deepar_m5")
@@ -93,6 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Train DeepAR on sampled M5 windows and write checkpoints/artifacts."""
+
     args = build_parser().parse_args(argv)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

@@ -14,6 +14,8 @@ from .train import batch_to_torch, choose_device
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict:
+    """Load a PyTorch checkpoint while supporting older PyTorch versions."""
+
     try:
         return torch.load(path, map_location=device, weights_only=False)
     except TypeError:
@@ -21,6 +23,8 @@ def load_checkpoint(path: Path, device: torch.device) -> dict:
 
 
 def make_fallback_forecasts(data_dir: Path, prediction_length: int) -> dict[str, np.ndarray]:
+    """Build recent-history fallback forecasts for series absent from a pilot model."""
+
     sales_path = data_dir / "sales_train_evaluation.csv"
     if not sales_path.exists():
         sales_path = data_dir / "sales_train_validation.csv"
@@ -31,12 +35,16 @@ def make_fallback_forecasts(data_dir: Path, prediction_length: int) -> dict[str,
 
 
 def normalize_submission_id(series_id: str) -> str:
+    """Map M5 validation ids to evaluation ids used by the training file."""
+
     if series_id.endswith("_validation"):
         return series_id[: -len("_validation")] + "_evaluation"
     return series_id
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Define CLI arguments for checkpoint inference and submission writing."""
+
     parser = argparse.ArgumentParser(description="Run DeepAR inference and write an M5 submission file.")
     parser.add_argument("--data-dir", default="m5-forecasting-accuracy")
     parser.add_argument("--checkpoint", default="artifacts/deepar_m5/best.pt")
@@ -47,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Load a trained DeepAR checkpoint and write a complete submission CSV."""
+
     args = build_parser().parse_args(argv)
     device = choose_device(args.device)
     checkpoint = load_checkpoint(Path(args.checkpoint), device)

@@ -14,6 +14,8 @@ STATIC_COLUMNS = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
 
 @dataclass
 class DataConfig:
+    """Runtime settings that define how M5 data is loaded and windowed."""
+
     data_dir: str = "m5-forecasting-accuracy"
     subset_size: int | None = 1000
     context_length: int = 56
@@ -24,6 +26,8 @@ class DataConfig:
 
 @dataclass
 class M5Bundle:
+    """In-memory representation shared by training, validation, and inference."""
+
     sales_frame: pd.DataFrame
     calendar_frame: pd.DataFrame
     sales_values: np.ndarray
@@ -36,22 +40,32 @@ class M5Bundle:
 
     @property
     def num_series(self) -> int:
+        """Return the number of item-store series in the loaded subset."""
+
         return int(self.sales_values.shape[0])
 
     @property
     def known_days(self) -> int:
+        """Return the number of observed target days in the sales matrix."""
+
         return int(self.sales_values.shape[1])
 
     @property
     def cardinalities(self) -> list[int]:
+        """Return embedding cardinalities for each static categorical encoder."""
+
         return [max(mapping.values(), default=0) + 1 for mapping in self.encoders.values()]
 
 
 def day_number(day_name: str) -> int:
+    """Convert an M5 day label such as ``d_1941`` to its integer index."""
+
     return int(day_name.split("_", 1)[1])
 
 
 def find_day_columns(columns: Iterable[str]) -> list[str]:
+    """Find and numerically sort daily sales columns from an M5 sales file."""
+
     return sorted(
         [col for col in columns if col.startswith("d_") and col[2:].isdigit()],
         key=day_number,
@@ -59,6 +73,8 @@ def find_day_columns(columns: Iterable[str]) -> list[str]:
 
 
 def fit_encoders(frame: pd.DataFrame) -> dict[str, dict[str, int]]:
+    """Fit integer encoders for static categorical metadata columns."""
+
     encoders: dict[str, dict[str, int]] = {}
     for column in STATIC_COLUMNS:
         values = sorted(frame[column].astype(str).unique().tolist())
@@ -67,6 +83,8 @@ def fit_encoders(frame: pd.DataFrame) -> dict[str, dict[str, int]]:
 
 
 def encode_static(frame: pd.DataFrame, encoders: dict[str, dict[str, int]]) -> np.ndarray:
+    """Encode static metadata columns into a dense integer matrix."""
+
     encoded = []
     for column in STATIC_COLUMNS:
         mapping = encoders[column]
@@ -75,15 +93,21 @@ def encode_static(frame: pd.DataFrame, encoders: dict[str, dict[str, int]]) -> n
 
 
 def save_json(path: Path, payload: dict) -> None:
+    """Write JSON metadata with parent-directory creation."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def load_json(path: Path) -> dict:
+    """Load a JSON metadata file."""
+
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def select_series(frame: pd.DataFrame, subset_size: int | None, seed: int) -> pd.DataFrame:
+    """Select a reproducible, roughly category-store-balanced pilot subset."""
+
     if subset_size is None or subset_size <= 0 or subset_size >= len(frame):
         return frame.reset_index(drop=True)
 
@@ -105,6 +129,8 @@ def select_series(frame: pd.DataFrame, subset_size: int | None, seed: int) -> pd
 
 
 def _common_calendar_covariates(calendar: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
+    """Build calendar covariates that are identical for all item-store series."""
+
     wday = calendar["wday"].astype(float).to_numpy()
     month = calendar["month"].astype(float).to_numpy()
     event_1 = calendar["event_name_1"].notna().astype(float).to_numpy()
@@ -143,6 +169,8 @@ def _build_price_covariates(
     calendar: pd.DataFrame,
     prices: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Align weekly sell prices to daily rows for the selected item-store pairs."""
+
     calendar_weeks = calendar["wm_yr_wk"].to_numpy()
     log_prices = np.zeros((len(sales_frame), len(calendar)), dtype=np.float32)
     missing = np.ones_like(log_prices, dtype=np.float32)
@@ -175,6 +203,8 @@ def _build_covariate_cube(
     calendar: pd.DataFrame,
     prices: pd.DataFrame,
 ) -> tuple[np.ndarray, list[str]]:
+    """Create the full ``series x day x feature`` known-covariate tensor."""
+
     common, names = _common_calendar_covariates(calendar)
     common = np.broadcast_to(common[None, :, :], (len(sales_frame), common.shape[0], common.shape[1]))
 
@@ -190,6 +220,8 @@ def _build_covariate_cube(
 
 
 def _series_scales(values: np.ndarray, train_end: int) -> np.ndarray:
+    """Compute per-series demand scales from history before the validation split."""
+
     scales = np.ones(values.shape[0], dtype=np.float32)
     history = values[:, :train_end]
     for idx, series in enumerate(history):
@@ -204,6 +236,12 @@ def load_m5_bundle(
     encoders: dict[str, dict[str, int]] | None = None,
     series_ids: list[str] | None = None,
 ) -> M5Bundle:
+    """Load M5 CSVs and return model-ready arrays plus metadata.
+
+    When ``series_ids`` is provided, the function preserves that exact order so
+    inference predictions line up with the checkpoint's selected series.
+    """
+
     data_dir = Path(config.data_dir)
     sales_path = data_dir / config.sales_file
     if not sales_path.exists():
@@ -249,7 +287,11 @@ def load_m5_bundle(
 
 
 class WindowSampler:
+    """Sample train/validation/inference windows without materializing all windows."""
+
     def __init__(self, bundle: M5Bundle, context_length: int, prediction_length: int, seed: int = 42):
+        """Create a sampler for fixed-length context-plus-prediction sequences."""
+
         self.bundle = bundle
         self.context_length = context_length
         self.prediction_length = prediction_length
@@ -260,12 +302,16 @@ class WindowSampler:
             raise ValueError("Not enough known days for the requested context and prediction lengths.")
 
     def sample_train_batch(self, batch_size: int) -> dict[str, np.ndarray]:
+        """Sample random rolling windows from the training portion of the data."""
+
         series_idx = self.rng.integers(0, self.bundle.num_series, size=batch_size)
         max_start = self.train_end - self.sequence_length
         starts = self.rng.integers(0, max_start + 1, size=batch_size)
         return self._make_batch(series_idx, starts)
 
     def iter_validation_batches(self, batch_size: int) -> Iterable[dict[str, np.ndarray]]:
+        """Yield deterministic validation windows ending at the last known day."""
+
         start = self.train_end - self.context_length
         starts = np.full((self.bundle.num_series,), start, dtype=np.int64)
         all_indices = np.arange(self.bundle.num_series)
@@ -273,6 +319,8 @@ class WindowSampler:
             yield self._make_batch(all_indices[offset : offset + batch_size], starts[offset : offset + batch_size])
 
     def make_inference_batch(self, series_idx: np.ndarray) -> dict[str, np.ndarray]:
+        """Build context windows for autoregressive future decoding."""
+
         forecast_start = self.bundle.known_days
         start = forecast_start - self.context_length
         positions = start + np.arange(self.sequence_length)
@@ -288,6 +336,8 @@ class WindowSampler:
         }
 
     def _make_batch(self, series_idx: np.ndarray, starts: np.ndarray) -> dict[str, np.ndarray]:
+        """Assemble target, covariate, static, scale, and mask arrays for windows."""
+
         offsets = np.arange(self.sequence_length)
         positions = starts[:, None] + offsets[None, :]
         targets = self.bundle.sales_values[series_idx[:, None], positions]
@@ -304,4 +354,6 @@ class WindowSampler:
 
 
 def config_to_dict(config: DataConfig) -> dict:
+    """Convert a data config dataclass to a serializable dictionary."""
+
     return asdict(config)

@@ -11,6 +11,8 @@ from .train import batch_to_torch, choose_device
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Define CLI arguments for a small end-to-end sanity check."""
+
     parser = argparse.ArgumentParser(description="Smoke-test the from-scratch DeepAR M5 pipeline.")
     parser.add_argument("--data-dir", default="m5-forecasting-accuracy")
     parser.add_argument("--subset-size", type=int, default=12)
@@ -22,6 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Verify data loading, forward pass, loss, backprop, and prediction shapes."""
+
     args = build_parser().parse_args(argv)
     config = DataConfig(
         data_dir=args.data_dir,
