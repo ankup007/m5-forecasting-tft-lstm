@@ -305,12 +305,7 @@ $$
  $$
 
 The loss is negative log likelihood:
-
-$$
-\mathrm{NLL}(z, \mu, \alpha)
-=
--\log p(z \mid \mu, \alpha)
-$$
+$$\mathrm{NLL}(z, \mu, \alpha) = -\log p(z \mid \mu, \alpha)$$
 
 In code:
 
