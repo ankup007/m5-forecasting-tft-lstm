@@ -145,14 +145,7 @@ The loss is applied only on the horizon part of the window.
 
 This follows the DeepAR training idea: maximize likelihood of observed target values under the distribution predicted by the recurrent network. In implementation terms, we minimize negative log likelihood:
 
-$$
-\mathcal{L}(\theta)
-=
--
-\sum_i
-\sum_{t \in \Omega_i}
-\log p_\theta(z_{i,t} \mid z_{i,1:t-1}, x_{i,1:T})
-$$
+$$\mathcal{L}(\theta) = - \sum_i \sum_{t \in \Omega_i} \log p_\theta(z_{i,t} \mid z_{i,1:t-1}, x_{i,1:T})$$
 
 where $\Omega_i$ is the set of time steps being scored. In this repo, $\Omega_i$ is selected by `loss_mask`, so only forecast-horizon positions in each sampled window are included.
 
