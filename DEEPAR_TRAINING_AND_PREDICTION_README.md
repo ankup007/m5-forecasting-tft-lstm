@@ -297,12 +297,12 @@ $$p(z \mid \mu, \alpha) = \frac{\Gamma(z + \alpha)} {\Gamma(\alpha)\Gamma(z + 1)
 
 Taking logs:
 
-307  $$
-308  \begin{aligned}
-309  \log p(z \mid \mu, \alpha) &= \log\Gamma(z + \alpha) - \log\Gamma(\alpha) - \log\Gamma(z + 1) \\
-310  &\quad + \alpha \left [\log\alpha - \log(\alpha + \mu)\right ] + z \left [\log\mu - \log(\alpha + \mu)\right ]
-311  \end{aligned}
-312  $$
+$$
+ \begin{aligned}
+ \log p(z \mid \mu, \alpha) &= \log\Gamma(z + \alpha) - \log\Gamma(\alpha) - \log\Gamma(z + 1) \\
+ &\quad + \alpha \left [\log\alpha - \log(\alpha + \mu)\right ] + z \left [\log\mu - \log(\alpha + \mu)\right ]
+ \end{aligned}
+ $$
 
 The loss is negative log likelihood:
 
