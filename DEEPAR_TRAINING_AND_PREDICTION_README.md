@@ -12,9 +12,9 @@ Primary references:
 DeepAR models a target series autoregressively:
 
 $$
-p(z_{t_0:T} \mid z_{1:t_0-1}, x_{1:T})
-=
-\prod_{t=t_0}^{T} p(z_t \mid z_{1:t-1}, x_{1:T})
+\begin{aligned}
+p(z_{t_0:T} \mid z_{1:t_0-1}, x_{1:T}) &= \prod_{t=t_0}^{T} p(z_t \mid z_{1:t-1}, x_{1:T})
+\end{aligned}
 $$
 
 Here:
