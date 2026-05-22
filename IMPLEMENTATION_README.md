@@ -51,6 +51,13 @@ Inference follows this path:
 5. The output is written in `sample_submission.csv` format.
 6. Series not present in a pilot checkpoint receive a simple recent-history fallback so the CSV is complete.
 
+If training used only a subset, inference does not retrain or expand the neural
+model to every M5 series. It reads `selected_series_ids` from the checkpoint and
+uses the model only for those item-store ids. Every other row in
+`sample_submission.csv` is filled with a fallback forecast based on the most
+recent observed `prediction_length` days from the same sales file used during
+training.
+
 ## What Is Implemented From Scratch
 
 The implementation intentionally avoids forecasting libraries and built-in recurrent layers.
@@ -73,6 +80,7 @@ Start with data and training-budget knobs before increasing model size.
 
 | Flag | Default | Tune when |
 |---|---:|---|
+| `--sales-file` | `sales_train_evaluation.csv` | Use `sales_train_validation.csv` when you want a blind forecast for `d_1914` through `d_1941`. Use the default when training up to `d_1941` and forecasting `d_1942` through `d_1969`. |
 | `--subset-size` | `1000` | Increase after smoke and pilot runs are stable. Use `0` or a value above dataset size for full data. |
 | `--context-length` | `56` | Increase to `84` or `112` if the model needs more history. This raises memory and runtime. |
 | `--prediction-length` | `28` | Keep at `28` for M5 submission training. Smaller values are useful for smoke tests. |
@@ -94,6 +102,53 @@ Recommended scaling path:
 ## Data Pipeline Notes
 
 `data.py` avoids building a giant long-format table. Sales remain in a wide NumPy array, while covariates are built as a compact series-day-feature cube.
+
+### M5 Validation And Evaluation Files
+
+M5 provides two sales files with the same 30,490 bottom-level item-store series:
+
+| File | Known target days | Typical use |
+|---|---:|---|
+| `sales_train_validation.csv` | `d_1` through `d_1913` | Train as if you are in the original validation stage, then forecast `d_1914` through `d_1941`. |
+| `sales_train_evaluation.csv` | `d_1` through `d_1941` | Train after validation actuals are known, then forecast the final evaluation horizon `d_1942` through `d_1969`. |
+
+The item/store pairs are the same. The row ids differ only by suffix:
+
+```text
+HOBBIES_1_001_CA_1_validation
+HOBBIES_1_001_CA_1_evaluation
+```
+
+The default CLI uses `sales_train_evaluation.csv`. With `--prediction-length 28`, the built-in validation split holds out the last 28 known days, so training windows stop at `d_1913` and validation scores `d_1914` through `d_1941`. That is useful for offline validation, but it means those 28 days are visible to the training run for validation/checkpoint selection.
+
+If the goal is a blind forecast for `d_1914` through `d_1941`, use:
+
+```powershell
+python scripts\train_deepar_m5.py --sales-file sales_train_validation.csv --prediction-length 28 --context-length 56 --device auto
+```
+
+With that setting, the script's internal validation holdout becomes `d_1886` through `d_1913`, and inference from the checkpoint forecasts `d_1914` through `d_1941`.
+
+Inference uses the checkpoint's saved `sales_file` setting:
+
+| Checkpoint trained with | Inference context ends at | Model forecast horizon | Fallback repeats |
+|---|---:|---:|---:|
+| `sales_train_validation.csv` | `d_1913` | `d_1914` through `d_1941` | recent days before `d_1914`, normally `d_1886` through `d_1913` for a 28-day horizon |
+| `sales_train_evaluation.csv` | `d_1941` | `d_1942` through `d_1969` | recent days before `d_1942`, normally `d_1914` through `d_1941` for a 28-day horizon |
+
+For subset experiments, `predict_deepar_m5.py` still writes all rows from
+`sample_submission.csv`. Rows belonging to checkpoint-selected series receive
+DeepAR forecasts. Rows outside the subset receive fallback forecasts, and the
+logs report how many rows were filled by each path.
+
+Calendar and price data extend farther than the observed sales target:
+
+```text
+calendar.csv: d_1 through d_1969
+sell_prices.csv: weekly prices keyed by wm_yr_wk
+```
+
+That is intentional. Future calendar, SNAP, and planned price information are known covariates, so they can be used for forecast horizons where future sales are unknown. The model must not use future sales-derived features, but it can use future known covariates.
 
 Current covariates:
 
@@ -206,4 +261,3 @@ Before modifying the model:
 - Check that the new feature is available for both training and prediction horizons.
 - Keep the first run tiny and CPU-based.
 - Compare `metrics.json` across runs before scaling up.
-

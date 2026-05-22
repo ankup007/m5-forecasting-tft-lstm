@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import logging
 
 import numpy as np
 import torch
 
 from .data import DataConfig, WindowSampler, load_m5_bundle
 from .model import DeepAR, ModelConfig, negative_binomial_nll
-from .train import batch_to_torch, choose_device
+from .train import batch_to_torch, choose_device, configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,20 +19,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description="Smoke-test the from-scratch DeepAR M5 pipeline.")
     parser.add_argument("--data-dir", default="m5-forecasting-accuracy")
+    parser.add_argument("--sales-file", default="sales_train_evaluation.csv")
     parser.add_argument("--subset-size", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--context-length", type=int, default=28)
     parser.add_argument("--prediction-length", type=int, default=7)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--log-level", default="INFO")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Verify data loading, forward pass, loss, backprop, and prediction shapes."""
+    """Verify data loading, forward pass, loss, backprop, and prediction shapes.
+
+    This runs a tiny end-to-end path: load a selected M5 subset, sample one
+    training window batch, compute Negative Binomial distribution parameters,
+    backpropagate one optimizer step, and decode a small inference batch.
+    """
 
     args = build_parser().parse_args(argv)
+    configure_logging(args.log_level)
     config = DataConfig(
         data_dir=args.data_dir,
+        sales_file=args.sales_file,
         subset_size=args.subset_size,
         context_length=args.context_length,
         prediction_length=args.prediction_length,
@@ -65,10 +78,13 @@ def main(argv: list[str] | None = None) -> None:
     )
     assert pred.shape == (min(3, bundle.num_series), args.prediction_length)
     assert torch.all(pred >= 0)
-    print(
+    logger.info(
         "smoke ok: "
-        f"series={bundle.num_series}, covariates={len(bundle.covariate_columns)}, "
-        f"loss={loss.item():.5f}, pred_shape={tuple(pred.shape)}"
+        "series=%s, covariates=%s, loss=%.5f, pred_shape=%s",
+        bundle.num_series,
+        len(bundle.covariate_columns),
+        loss.item(),
+        tuple(pred.shape),
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,10 @@ from tqdm import tqdm
 
 from .data import DataConfig, WindowSampler, find_day_columns, load_m5_bundle
 from .model import DeepAR, ModelConfig
-from .train import batch_to_torch, choose_device
+from .train import batch_to_torch, choose_device, configure_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict:
@@ -22,16 +26,27 @@ def load_checkpoint(path: Path, device: torch.device) -> dict:
         return torch.load(path, map_location=device)
 
 
-def make_fallback_forecasts(data_dir: Path, prediction_length: int) -> dict[str, np.ndarray]:
-    """Build recent-history fallback forecasts for series absent from a pilot model."""
+def make_fallback_forecasts(data_dir: Path, sales_file: str, prediction_length: int) -> dict[str, np.ndarray]:
+    """Build recent-history fallback forecasts for series absent from a pilot model.
 
-    sales_path = data_dir / "sales_train_evaluation.csv"
+    A quick subset model only predicts the item-store ids it was trained on. For
+    all other submission rows, this fallback repeats the most recent observed
+    horizon from the same sales file used by the checkpoint, so validation-style
+    runs do not accidentally use evaluation-period actuals.
+    """
+
+    sales_path = data_dir / sales_file
     if not sales_path.exists():
         sales_path = data_dir / "sales_train_validation.csv"
     sales = pd.read_csv(sales_path)
     day_columns = find_day_columns(sales.columns)
     fallback = sales[day_columns[-prediction_length:]].to_numpy(dtype=np.float32)
-    return {series_id: fallback[idx] for idx, series_id in enumerate(sales["id"].astype(str))}
+    forecasts: dict[str, np.ndarray] = {}
+    for idx, series_id in enumerate(sales["id"].astype(str)):
+        forecasts[series_id] = fallback[idx]
+        forecasts[alternate_submission_id(series_id)] = fallback[idx]
+    logger.info("Built fallback forecasts from %s for %s ids", sales_path, len(forecasts))
+    return forecasts
 
 
 def normalize_submission_id(series_id: str) -> str:
@@ -39,6 +54,16 @@ def normalize_submission_id(series_id: str) -> str:
 
     if series_id.endswith("_validation"):
         return series_id[: -len("_validation")] + "_evaluation"
+    return series_id
+
+
+def alternate_submission_id(series_id: str) -> str:
+    """Return the matching M5 id with the other validation/evaluation suffix."""
+
+    if series_id.endswith("_validation"):
+        return series_id[: -len("_validation")] + "_evaluation"
+    if series_id.endswith("_evaluation"):
+        return series_id[: -len("_evaluation")] + "_validation"
     return series_id
 
 
@@ -51,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="artifacts/deepar_m5/submission.csv")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--log-level", default="INFO")
     return parser
 
 
@@ -58,12 +84,13 @@ def main(argv: list[str] | None = None) -> None:
     """Load a trained DeepAR checkpoint and write a complete submission CSV."""
 
     args = build_parser().parse_args(argv)
+    configure_logging(args.log_level)
     device = choose_device(args.device)
     checkpoint = load_checkpoint(Path(args.checkpoint), device)
     data_config = DataConfig(**checkpoint["data_config"])
     data_config.data_dir = args.data_dir
 
-    print("Loading selected series for inference...")
+    logger.info("Loading selected series for inference")
     bundle = load_m5_bundle(
         data_config,
         encoders=checkpoint["encoders"],
@@ -90,29 +117,40 @@ def main(argv: list[str] | None = None) -> None:
                 context_length=data_config.context_length,
             )
         predictions[series_idx] = pred.clamp_min(0.0).cpu().numpy()
+    logger.info("Predictions shape=%s", predictions.shape)
 
     pred_map = {
         series_id: predictions[idx]
         for idx, series_id in enumerate(bundle.sales_frame["id"].astype(str).tolist())
     }
-    fallback_map = make_fallback_forecasts(Path(args.data_dir), data_config.prediction_length)
+    fallback_map = make_fallback_forecasts(Path(args.data_dir), data_config.sales_file, data_config.prediction_length)
 
     sample = pd.read_csv(Path(args.data_dir) / "sample_submission.csv")
     forecast_columns = [f"F{i}" for i in range(1, data_config.prediction_length + 1)]
     sample[forecast_columns] = sample[forecast_columns].astype(np.float32)
     output_values = np.zeros((len(sample), data_config.prediction_length), dtype=np.float32)
+    model_rows = 0
+    fallback_rows = 0
     for row_idx, series_id in enumerate(sample["id"].astype(str)):
-        eval_id = normalize_submission_id(series_id)
-        if eval_id in pred_map:
-            output_values[row_idx] = pred_map[eval_id]
-        elif eval_id in fallback_map:
-            output_values[row_idx] = fallback_map[eval_id]
+        candidate_ids = [series_id, normalize_submission_id(series_id), alternate_submission_id(series_id)]
+        for candidate_id in candidate_ids:
+            if candidate_id in pred_map:
+                output_values[row_idx] = pred_map[candidate_id]
+                model_rows += 1
+                break
+        else:
+            for candidate_id in candidate_ids:
+                if candidate_id in fallback_map:
+                    output_values[row_idx] = fallback_map[candidate_id]
+                    fallback_rows += 1
+                    break
 
     sample[forecast_columns] = pd.DataFrame(output_values, columns=forecast_columns, index=sample.index)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sample.to_csv(output_path, index=False)
-    print(f"Wrote {output_path}")
+    logger.info("Submission rows filled with model=%s fallback=%s total=%s", model_rows, fallback_rows, len(sample))
+    logger.info("Wrote %s", output_path)
 
 
 if __name__ == "__main__":

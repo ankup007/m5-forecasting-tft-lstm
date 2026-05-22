@@ -42,6 +42,8 @@ The comparison should keep the validation horizon, feature set, context length, 
 
 The repository includes a PyTorch-only DeepAR implementation under `src/deepar_m5`. It does not use forecasting libraries or built-in recurrent layers; the LSTM cell, negative-binomial likelihood, sampled training windows, training loop, and autoregressive inference are implemented directly.
 
+For a code walkthrough, tuning guide, and extension notes, read [DeepAR Implementation Guide](./IMPLEMENTATION_README.md).
+
 Create the isolated conda environment:
 
 ```powershell
@@ -61,11 +63,20 @@ Train a pilot model:
 python scripts\train_deepar_m5.py --subset-size 1000 --context-length 56 --prediction-length 28 --batch-size 128 --epochs 10 --steps-per-epoch 200 --device auto
 ```
 
+By default, training uses `sales_train_evaluation.csv`, which contains the same 30,490 item-store series as `sales_train_validation.csv` plus the extra actual sales days `d_1914` through `d_1941`. With a 28-day horizon, the script trains on windows ending before those final 28 known days and uses `d_1914` through `d_1941` as its internal validation holdout. To simulate the original validation-stage forecast, train with `--sales-file sales_train_validation.csv`; that uses only `d_1` through `d_1913` as known sales and forecasts `d_1914` through `d_1941` at inference time.
+
 Generate a submission-shaped file:
 
 ```powershell
 python scripts\predict_deepar_m5.py --checkpoint artifacts\deepar_m5\best.pt --output artifacts\deepar_m5\submission.csv --device auto
 ```
+
+If the checkpoint was trained on a subset, prediction uses the saved
+`selected_series_ids` from that checkpoint. Those series receive DeepAR model
+forecasts; all other `sample_submission.csv` rows receive a recent-history
+fallback so the output file is complete. The fallback uses the same sales file
+recorded in the checkpoint, avoiding validation/evaluation leakage across the
+two M5 sales files.
 
 ## References
 

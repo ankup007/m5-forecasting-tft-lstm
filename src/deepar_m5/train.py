@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,18 @@ from tqdm import trange
 
 from .data import DataConfig, WindowSampler, config_to_dict, load_m5_bundle, save_json
 from .model import DeepAR, ModelConfig, negative_binomial_nll
+
+
+logger = logging.getLogger(__name__)
+
+
+def configure_logging(log_level: str) -> None:
+    """Configure process-wide CLI logging with a compact module-aware format."""
+
+    level = getattr(logging, log_level.upper(), None)
+    if not isinstance(level, int):
+        raise ValueError(f"Unknown log level: {log_level}")
+    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
 
 
 def batch_to_torch(batch: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
@@ -84,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description="Train a from-scratch DeepAR model on M5 data.")
     parser.add_argument("--data-dir", default="m5-forecasting-accuracy")
+    parser.add_argument("--sales-file", default="sales_train_evaluation.csv")
     parser.add_argument("--artifact-dir", default="artifacts/deepar_m5")
     parser.add_argument("--subset-size", type=int, default=1000)
     parser.add_argument("--context-length", type=int, default=56)
@@ -99,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--log-level", default="INFO")
     return parser
 
 
@@ -106,11 +121,13 @@ def main(argv: list[str] | None = None) -> None:
     """Train DeepAR on sampled M5 windows and write checkpoints/artifacts."""
 
     args = build_parser().parse_args(argv)
+    configure_logging(args.log_level)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     data_config = DataConfig(
         data_dir=args.data_dir,
+        sales_file=args.sales_file,
         subset_size=args.subset_size,
         context_length=args.context_length,
         prediction_length=args.prediction_length,
@@ -119,7 +136,7 @@ def main(argv: list[str] | None = None) -> None:
     artifact_dir = Path(args.artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading M5 data...")
+    logger.info("Loading M5 data")
     bundle = load_m5_bundle(data_config)
     sampler = WindowSampler(bundle, args.context_length, args.prediction_length, seed=args.seed)
     device = choose_device(args.device)
@@ -145,7 +162,7 @@ def main(argv: list[str] | None = None) -> None:
         index=False,
     )
 
-    print(f"Training on {bundle.num_series} series, device={device}, covariates={len(bundle.covariate_columns)}")
+    logger.info("Training on %s series, device=%s, covariates=%s", bundle.num_series, device, len(bundle.covariate_columns))
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -165,7 +182,7 @@ def main(argv: list[str] | None = None) -> None:
         train_loss = running_loss / max(args.steps_per_epoch, 1)
         val_loss = evaluate(model, sampler, args.batch_size, device)
         metrics.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        print(f"epoch={epoch} train_nll={train_loss:.5f} val_nll={val_loss:.5f}")
+        logger.info("epoch=%s train_nll=%.5f val_nll=%.5f", epoch, train_loss, val_loss)
 
         save_checkpoint(
             artifact_dir / "latest.pt",
