@@ -12,9 +12,9 @@ Primary references:
 DeepAR models a target series autoregressively:
 
 $$
-p(z_{t_0:T} \mid z_{1:t_0-1}, x_{1:T})
-=
-\prod_{t=t_0}^{T} p(z_t \mid z_{1:t-1}, x_{1:T})
+\begin{aligned}
+p(z_{t_0:T} \mid z_{1:t_0-1}, x_{1:T}) &= \prod_{t=t_0}^{T} p(z_t \mid z_{1:t-1}, x_{1:T})
+\end{aligned}
 $$
 
 Here:
@@ -145,14 +145,7 @@ The loss is applied only on the horizon part of the window.
 
 This follows the DeepAR training idea: maximize likelihood of observed target values under the distribution predicted by the recurrent network. In implementation terms, we minimize negative log likelihood:
 
-$$
-\mathcal{L}(\theta)
-=
--
-\sum_i
-\sum_{t \in \Omega_i}
-\log p_\theta(z_{i,t} \mid z_{i,1:t-1}, x_{i,1:T})
-$$
+$$\mathcal{L}(\theta) = - \sum_i \sum_{t \in \Omega_i} \log p_\theta(z_{i,t} \mid z_{i,1:t-1}, x_{i,1:T})$$
 
 where $\Omega_i$ is the set of time steps being scored. In this repo, $\Omega_i$ is selected by `loss_mask`, so only forecast-horizon positions in each sampled window are included.
 
@@ -197,12 +190,7 @@ future steps:
 
 For a 7-day horizon:
 
-$$
-p(z_{t+1:t+7} \mid z_{1:t})
-=
-\prod_{k=1}^{7}
-p(z_{t+k} \mid z_{1:t}, \hat{z}_{t+1:t+k-1}, x_{1:t+7})
-$$
+$$p(z_{t+1:t+7} \mid z_{1:t}) = \prod_{k=1}^{7} p(z_{t+k} \mid z_{1:t}, \hat{z}_{t+1:t+k-1}, x_{1:t+7})$$
 
 This is the autoregressive forecast rollout described by DeepAR.
 
@@ -340,34 +328,19 @@ mus.append(mu_scaled * scale)
 
 The Negative Binomial probability mass function used here is:
 
-$$
-p(z \mid \mu, \alpha)
-=
-\frac{\Gamma(z + \alpha)}
-{\Gamma(\alpha)\Gamma(z + 1)}
-\left(\frac{\alpha}{\alpha + \mu}\right)^\alpha
-\left(\frac{\mu}{\alpha + \mu}\right)^z
-$$
+$$p(z \mid \mu, \alpha) = \frac{\Gamma(z + \alpha)} {\Gamma(\alpha)\Gamma(z + 1)} \left(\frac{\alpha}{\alpha + \mu}\right)^\alpha \left(\frac{\mu}{\alpha + \mu}\right)^z$$
 
 Taking logs:
 
 $$
-\log p(z \mid \mu, \alpha)
-=
-\log\Gamma(z + \alpha)
-- \log\Gamma(\alpha)
-- \log\Gamma(z + 1)
-+ \alpha \left[\log\alpha - \log(\alpha + \mu)\right]
-+ z \left[\log\mu - \log(\alpha + \mu)\right]
-$$
+ \begin{aligned}
+ \log p(z \mid \mu, \alpha) &= \log\Gamma(z + \alpha) - \log\Gamma(\alpha) - \log\Gamma(z + 1) \\
+ &\quad + \alpha \left [\log\alpha - \log(\alpha + \mu)\right ] + z \left [\log\mu - \log(\alpha + \mu)\right ]
+ \end{aligned}
+ $$
 
 The loss is negative log likelihood:
-
-$$
-\mathrm{NLL}(z, \mu, \alpha)
-=
--\log p(z \mid \mu, \alpha)
-$$
+$$\mathrm{NLL}(z, \mu, \alpha) = -\log p(z \mid \mu, \alpha)$$
 
 In code:
 
