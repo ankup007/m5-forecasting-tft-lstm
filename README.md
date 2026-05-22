@@ -44,6 +44,8 @@ The repository includes a PyTorch-only DeepAR implementation under `src/deepar_m
 
 For a code walkthrough, tuning guide, and extension notes, read [DeepAR Implementation Guide](./IMPLEMENTATION_README.md).
 
+For the training/prediction mechanics, including teacher forcing, autoregressive rollout, Negative Binomial likelihood, and mean versus sampled forecasts, read [Understanding DeepAR Training And Prediction](./DEEPAR_TRAINING_AND_PREDICTION_README.md).
+
 Create the isolated conda environment:
 
 ```powershell

@@ -2,6 +2,8 @@
 
 This guide explains how the from-scratch DeepAR pipeline is organized, where to start reading, what to tune first, and where to extend the implementation.
 
+For a deeper explanation of the training objective, teacher forcing, autoregressive prediction, Negative Binomial likelihood, and mean versus sampled forecasting, read [Understanding DeepAR Training And Prediction](./DEEPAR_TRAINING_AND_PREDICTION_README.md).
+
 ## Where To Start
 
 Start with the thin scripts in `scripts/`:
