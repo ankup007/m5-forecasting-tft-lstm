@@ -186,6 +186,59 @@ class DeepAR(nn.Module):
 
         return torch.cat(predictions, dim=1)
 
+    @torch.no_grad()
+    def predict_samples(
+        self,
+        target: torch.Tensor,
+        covariates: torch.Tensor,
+        static_cats: torch.Tensor,
+        scale: torch.Tensor,
+        context_length: int,
+        num_samples: int,
+    ) -> torch.Tensor:
+        """Decode future sample paths from the predicted Negative Binomial distributions.
+
+        The context portion uses observed targets exactly like ``predict_mean``.
+        Once the horizon starts, each sample path draws from the model's
+        predicted count distribution and feeds that sampled value into the next
+        autoregressive step. The result shape is
+        ``(num_samples, batch, prediction_length)``.
+        """
+
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive")
+
+        batch_size, seq_len = target.shape
+        repeated_target = target.repeat_interleave(num_samples, dim=0)
+        repeated_covariates = covariates.repeat_interleave(num_samples, dim=0)
+        repeated_static_cats = static_cats.repeat_interleave(num_samples, dim=0)
+        repeated_scale = scale.repeat_interleave(num_samples, dim=0)
+
+        static_emb = self.static_embedding(repeated_static_cats)
+        log_scale = torch.log1p(repeated_scale)
+        states = self.initial_state(batch_size * num_samples, target.device)
+
+        prev_scaled = torch.zeros(batch_size * num_samples, 1, device=target.device)
+        samples = []
+        for step in range(seq_len):
+            mu_scaled, alpha, states = self._step(
+                prev_scaled,
+                repeated_covariates[:, step, :],
+                static_emb,
+                log_scale,
+                states,
+            )
+            if step >= context_length:
+                mu = mu_scaled * repeated_scale
+                sample = sample_negative_binomial(mu, alpha)
+                samples.append(sample)
+                prev_scaled = sample / repeated_scale.clamp_min(1e-4)
+            else:
+                prev_scaled = repeated_target[:, step : step + 1] / repeated_scale.clamp_min(1e-4)
+
+        stacked = torch.cat(samples, dim=1)
+        return stacked.view(batch_size, num_samples, -1).transpose(0, 1).contiguous()
+
     def to_config_dict(self) -> dict:
         """Return the serializable model configuration saved in checkpoints."""
 
@@ -219,3 +272,13 @@ def negative_binomial_nll(
     if mask is None:
         return loss.mean()
     return (loss * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def sample_negative_binomial(mu: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """Sample counts from the same Negative Binomial parameterization used by the loss."""
+
+    mu = mu.clamp_min(1e-6)
+    alpha = alpha.clamp_min(1e-6)
+    probs = (mu / (mu + alpha)).clamp(1e-6, 1.0 - 1e-6)
+    distribution = torch.distributions.NegativeBinomial(total_count=alpha, probs=probs)
+    return distribution.sample()

@@ -13,6 +13,7 @@ Start with the thin scripts in `scripts/`:
 | `scripts/smoke_deepar_m5.py` | Fast correctness check on a tiny subset. Run this before changing model or data code. |
 | `scripts/train_deepar_m5.py` | Main training entrypoint. CLI flags control subset size, model size, context length, and training budget. |
 | `scripts/predict_deepar_m5.py` | Loads a checkpoint and writes a Kaggle-shaped submission CSV. |
+| `scripts/run_deepar_m5_experiments.py` | Runs hyperparameter sweeps, trains on validation data, forecasts the evaluation holdout, and writes per-run metrics/artifacts. |
 
 The real implementation lives in `src/deepar_m5/`:
 
@@ -221,6 +222,70 @@ Training writes to `artifacts/deepar_m5/` by default:
 
 `artifacts/` is ignored by git.
 
+## Experiment Sweeps
+
+Use `run_deepar_m5_experiments.py` when you want to compare hyperparameters across repeatable runs. It is designed for this offline holdout setup:
+
+```text
+train file:      sales_train_validation.csv, d_1 through d_1913
+forecast target: d_1914 through d_1941
+actuals from:    sales_train_evaluation.csv
+```
+
+For each run, the script writes:
+
+| Artifact | Purpose |
+|---|---|
+| `best.pt` / `latest.pt` | Model checkpoints for that run. |
+| `train_metrics.json` | Per-epoch training NLL and internal validation NLL. |
+| `holdout_forecasts.csv` | Forecasts and actuals for selected series on the evaluation holdout. |
+| `holdout_metrics.json` | Holdout metrics for that run. |
+| `experiment_config.json` | Hyperparameters used for that run. |
+| `summary.csv` | One row per run across the sweep. |
+
+Example small sweep:
+
+```powershell
+python scripts\run_deepar_m5_experiments.py --subset-sizes 100 --context-lengths 28,56 --hidden-sizes 16,32 --embedding-dims 4,8 --epochs-list 2 --steps-per-epoch-list 20 --batch-sizes 16 --forecast-modes mean,quantile --quantiles 0.5,0.9 --num-samples 200 --output-dir artifacts\deepar_m5_experiments --device cpu
+```
+
+Enable Weights & Biases tracking:
+
+```powershell
+python scripts\run_deepar_m5_experiments.py --subset-sizes 100 --context-lengths 28,56 --hidden-sizes 16,32 --embedding-dims 4,8 --epochs-list 2 --steps-per-epoch-list 20 --batch-sizes 16 --forecast-modes mean,quantile --quantiles 0.5,0.9 --num-samples 200 --output-dir artifacts\deepar_m5_experiments --device cpu --wandb --wandb-project m5-competition --wandb-entity ankup25694 --wandb-group deepar-sweep-v1 --wandb-tags deepar,m5,sweep
+```
+
+For a no-network test run, use:
+
+```powershell
+--wandb --wandb-mode offline
+```
+
+W&B logs per training step:
+
+- `train/batch_nll`
+- `train/grad_norm`
+- `train/epoch`
+
+W&B logs per epoch:
+
+- `train/epoch_nll`
+- `validation/nll`
+
+The experiment sweep also logs holdout metrics under `holdout/*`, including `holdout/rmse`, `holdout/wape`, `holdout/rmsse`, and `holdout/bottom_wrmsse`.
+
+The script records:
+
+- `mae`
+- `rmse`
+- `wape`
+- `smape`
+- `mape_nonzero`
+- `rmsse`
+- `bottom_wrmsse`
+
+`bottom_wrmsse` is a bottom-level WRMSSE-style metric over the selected item-store series, using dollar-sales weights from the last training horizon. It is useful for model comparison in this repo, but it is not the full official M5 WRMSSE, which aggregates and weights all 42,840 hierarchy series.
+
 ## Common Commands
 
 Create the environment:
@@ -246,6 +311,12 @@ Generate predictions:
 
 ```powershell
 python scripts\predict_deepar_m5.py --checkpoint artifacts\deepar_m5\best.pt --output artifacts\deepar_m5\submission.csv --device auto
+```
+
+Generate a sampled quantile forecast:
+
+```powershell
+python scripts\predict_deepar_m5.py --checkpoint artifacts\deepar_m5\best.pt --output artifacts\deepar_m5\submission_p90.csv --forecast-mode quantile --quantile 0.9 --num-samples 500 --sample-seed 42 --device auto
 ```
 
 Run a faster debugging train:

@@ -78,13 +78,24 @@ def main(argv: list[str] | None = None) -> None:
     )
     assert pred.shape == (min(3, bundle.num_series), args.prediction_length)
     assert torch.all(pred >= 0)
+    samples = model.predict_samples(
+        infer_batch["target"],
+        infer_batch["covariates"],
+        infer_batch["static_cats"],
+        infer_batch["scale"],
+        context_length=args.context_length,
+        num_samples=4,
+    )
+    assert samples.shape == (4, min(3, bundle.num_series), args.prediction_length)
+    assert torch.all(samples >= 0)
     logger.info(
         "smoke ok: "
-        "series=%s, covariates=%s, loss=%.5f, pred_shape=%s",
+        "series=%s, covariates=%s, loss=%.5f, pred_shape=%s, sample_shape=%s",
         bundle.num_series,
         len(bundle.covariate_columns),
         loss.item(),
         tuple(pred.shape),
+        tuple(samples.shape),
     )
 
 

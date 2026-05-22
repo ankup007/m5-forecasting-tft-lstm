@@ -75,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default="artifacts/deepar_m5/best.pt")
     parser.add_argument("--output", default="artifacts/deepar_m5/submission.csv")
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--forecast-mode", default="mean", choices=["mean", "sample-mean", "quantile"])
+    parser.add_argument("--num-samples", type=int, default=100)
+    parser.add_argument("--quantile", type=float, default=0.5)
+    parser.add_argument("--sample-seed", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -85,6 +89,12 @@ def main(argv: list[str] | None = None) -> None:
 
     args = build_parser().parse_args(argv)
     configure_logging(args.log_level)
+    if args.num_samples <= 0:
+        raise ValueError("--num-samples must be positive")
+    if not 0.0 <= args.quantile <= 1.0:
+        raise ValueError("--quantile must be between 0 and 1")
+    if args.sample_seed is not None:
+        torch.manual_seed(args.sample_seed)
     device = choose_device(args.device)
     checkpoint = load_checkpoint(Path(args.checkpoint), device)
     data_config = DataConfig(**checkpoint["data_config"])
@@ -103,19 +113,39 @@ def main(argv: list[str] | None = None) -> None:
     model.eval()
 
     predictions = np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32)
+    logger.info(
+        "Forecast mode=%s num_samples=%s quantile=%.3f",
+        args.forecast_mode,
+        args.num_samples,
+        args.quantile,
+    )
     all_indices = np.arange(bundle.num_series)
     for offset in tqdm(range(0, bundle.num_series, args.batch_size), desc="predict"):
         series_idx = all_indices[offset : offset + args.batch_size]
         batch_np = sampler.make_inference_batch(series_idx)
         batch = batch_to_torch(batch_np, device)
         with torch.no_grad():
-            pred = model.predict_mean(
-                batch["target"],
-                batch["covariates"],
-                batch["static_cats"],
-                batch["scale"],
-                context_length=data_config.context_length,
-            )
+            if args.forecast_mode == "mean":
+                pred = model.predict_mean(
+                    batch["target"],
+                    batch["covariates"],
+                    batch["static_cats"],
+                    batch["scale"],
+                    context_length=data_config.context_length,
+                )
+            else:
+                samples = model.predict_samples(
+                    batch["target"],
+                    batch["covariates"],
+                    batch["static_cats"],
+                    batch["scale"],
+                    context_length=data_config.context_length,
+                    num_samples=args.num_samples,
+                )
+                if args.forecast_mode == "sample-mean":
+                    pred = samples.mean(dim=0)
+                else:
+                    pred = torch.quantile(samples, args.quantile, dim=0)
         predictions[series_idx] = pred.clamp_min(0.0).cpu().numpy()
     logger.info("Predictions shape=%s", predictions.shape)
 

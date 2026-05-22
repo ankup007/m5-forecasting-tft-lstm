@@ -27,6 +27,7 @@ env/
 
 # Model outputs
 artifacts/
+wandb/
 
 # Jupyter
 .ipynb_checkpoints/

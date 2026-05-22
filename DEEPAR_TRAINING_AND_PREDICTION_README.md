@@ -224,7 +224,9 @@ Those sample paths can then be summarized into:
 - quantiles such as P10, P50, P90
 - prediction intervals
 
-This repo currently uses mean decoding:
+This repo supports both mean decoding and sampled trajectory decoding.
+
+Mean decoding uses:
 
 ```python
 prev_scaled = mu_scaled
@@ -232,20 +234,53 @@ prev_scaled = mu_scaled
 
 That means it feeds the predicted mean back into the next future step instead of sampling a random value from the Negative Binomial distribution.
 
-So the current implementation is:
+That means it feeds the predicted mean back into the next future step instead of sampling a random value from the Negative Binomial distribution.
+
+Sampled decoding uses:
+
+```python
+sample = sample_negative_binomial(mu, alpha)
+prev_scaled = sample / repeated_scale.clamp_min(1e-4)
+```
+
+That means each simulated path feeds its own sampled value into the next future step.
+
+So the implementation supports:
 
 ```text
 probabilistic training loss
 mean autoregressive prediction
+sampled autoregressive prediction
+sample means and quantiles
 ```
 
-It is correct as a simple DeepAR-style mean forecaster, but it is not yet a full probabilistic sampler. To match the paper more closely for uncertainty estimates, add a sampling method that draws from:
+To match the paper more closely for uncertainty estimates, use the sampling path, which draws:
 
 $$
 z_t \sim \mathrm{NegativeBinomial}(\mu_t, \alpha_t)
 $$
 
-then rolls forward many paths and computes summary quantiles.
+then rolls forward many paths and computes summary statistics.
+
+Common usage:
+
+```bash
+# Deterministic mean-style point forecast.
+python scripts/predict_deepar_m5.py --forecast-mode mean
+
+# Monte Carlo mean from sampled paths.
+python scripts/predict_deepar_m5.py --forecast-mode sample-mean --num-samples 200 --sample-seed 42
+
+# P90 forecast from sampled paths.
+python scripts/predict_deepar_m5.py --forecast-mode quantile --quantile 0.9 --num-samples 500 --sample-seed 42
+```
+
+Typical practice:
+
+- Use `mean` when you want a fast point forecast.
+- Use `sample-mean` when you want the expected value implied by sampled trajectories.
+- Use `quantile` when you need uncertainty-aware forecasts such as P10, P50, or P90.
+- Increase `--num-samples` for smoother quantiles, at the cost of slower inference.
 
 ## Why Negative Binomial For M5
 
@@ -385,8 +420,11 @@ So when comparing formulas, check whether $\alpha$ means shape or dispersion.
 | Build inference windows with future placeholders | [`WindowSampler.make_inference_batch`](./src/deepar_m5/data.py) |
 | Teacher-forced training | [`DeepAR.forward`](./src/deepar_m5/model.py) |
 | Mean autoregressive prediction | [`DeepAR.predict_mean`](./src/deepar_m5/model.py) |
+| Sampled autoregressive prediction | [`DeepAR.predict_samples`](./src/deepar_m5/model.py) |
 | Negative Binomial parameters | [`DeepAR._step`](./src/deepar_m5/model.py) |
 | Negative Binomial NLL | [`negative_binomial_nll`](./src/deepar_m5/model.py) |
+| Negative Binomial sampling | [`sample_negative_binomial`](./src/deepar_m5/model.py) |
+| Prediction mode CLI | [`infer.py`](./src/deepar_m5/infer.py) |
 
 ## Practical Summary
 
@@ -405,4 +443,4 @@ predicted mean -> next future input
 repeat until horizon is complete
 ```
 
-The implementation is aligned with the DeepAR autoregressive likelihood idea, with one simplification: inference currently rolls forward using predicted means rather than sampled paths. That is fine for point forecasts, but sampled paths are needed for full probabilistic forecasts and quantiles.
+The implementation is aligned with the DeepAR autoregressive likelihood idea. Use `--forecast-mode mean` for fast point forecasts, or `--forecast-mode quantile` / `--forecast-mode sample-mean` when you want predictions based on sampled future paths.

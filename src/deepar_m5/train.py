@@ -11,6 +11,7 @@ from tqdm import trange
 
 from .data import DataConfig, WindowSampler, config_to_dict, load_m5_bundle, save_json
 from .model import DeepAR, ModelConfig, negative_binomial_nll
+from .wandb_utils import add_wandb_args, init_wandb, wandb_finish, wandb_log, wandb_save
 
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-level", default="INFO")
+    add_wandb_args(parser)
     return parser
 
 
@@ -153,6 +155,16 @@ def main(argv: list[str] | None = None) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     metrics: list[dict[str, float | int]] = []
     best_val_loss = float("inf")
+    wandb_run = init_wandb(
+        args,
+        config={
+            **vars(args),
+            "num_series": bundle.num_series,
+            "covariate_dim": len(bundle.covariate_columns),
+            "cardinalities": bundle.cardinalities,
+            "device_resolved": str(device),
+        },
+    )
 
     save_json(artifact_dir / "encoders.json", bundle.encoders)
     save_json(artifact_dir / "data_config.json", config_to_dict(data_config))
@@ -163,41 +175,50 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     logger.info("Training on %s series, device=%s, covariates=%s", bundle.num_series, device, len(bundle.covariate_columns))
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        running_loss = 0.0
-        progress = trange(args.steps_per_epoch, desc=f"epoch {epoch}", leave=False)
-        for _ in progress:
-            batch_np = sampler.sample_train_batch(args.batch_size)
-            batch = batch_to_torch(batch_np, device)
-            optimizer.zero_grad(set_to_none=True)
-            mu, alpha = model(batch["target"], batch["covariates"], batch["static_cats"], batch["scale"])
-            loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            running_loss += float(loss.item())
-            progress.set_postfix(loss=f"{loss.item():.4f}")
+    try:
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            running_loss = 0.0
+            progress = trange(args.steps_per_epoch, desc=f"epoch {epoch}", leave=False)
+            for step_idx in progress:
+                global_step = (epoch - 1) * args.steps_per_epoch + step_idx + 1
+                batch_np = sampler.sample_train_batch(args.batch_size)
+                batch = batch_to_torch(batch_np, device)
+                optimizer.zero_grad(set_to_none=True)
+                mu, alpha = model(batch["target"], batch["covariates"], batch["static_cats"], batch["scale"])
+                loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+                batch_loss = float(loss.item())
+                running_loss += batch_loss
+                progress.set_postfix(loss=f"{batch_loss:.4f}")
+                wandb_log(
+                    wandb_run,
+                    {
+                        "train/batch_nll": batch_loss,
+                        "train/grad_norm": float(grad_norm),
+                        "train/epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
-        train_loss = running_loss / max(args.steps_per_epoch, 1)
-        val_loss = evaluate(model, sampler, args.batch_size, device)
-        metrics.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        logger.info("epoch=%s train_nll=%.5f val_nll=%.5f", epoch, train_loss, val_loss)
+            train_loss = running_loss / max(args.steps_per_epoch, 1)
+            val_loss = evaluate(model, sampler, args.batch_size, device)
+            metrics.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+            logger.info("epoch=%s train_nll=%.5f val_nll=%.5f", epoch, train_loss, val_loss)
+            wandb_log(
+                wandb_run,
+                {
+                    "train/epoch_nll": train_loss,
+                    "validation/nll": val_loss,
+                    "train/epoch": epoch,
+                },
+                step=epoch * args.steps_per_epoch,
+            )
 
-        save_checkpoint(
-            artifact_dir / "latest.pt",
-            model,
-            optimizer,
-            data_config,
-            bundle,
-            epoch,
-            best_val_loss,
-            args,
-        )
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
             save_checkpoint(
-                artifact_dir / "best.pt",
+                artifact_dir / "latest.pt",
                 model,
                 optimizer,
                 data_config,
@@ -206,8 +227,25 @@ def main(argv: list[str] | None = None) -> None:
                 best_val_loss,
                 args,
             )
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                save_checkpoint(
+                    artifact_dir / "best.pt",
+                    model,
+                    optimizer,
+                    data_config,
+                    bundle,
+                    epoch,
+                    best_val_loss,
+                    args,
+                )
 
-        (artifact_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            metrics_path = artifact_dir / "metrics.json"
+            metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+            wandb_save(wandb_run, metrics_path)
+            wandb_save(wandb_run, artifact_dir / "best.pt")
+    finally:
+        wandb_finish(wandb_run)
 
 
 if __name__ == "__main__":

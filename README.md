@@ -73,12 +73,32 @@ Generate a submission-shaped file:
 python scripts\predict_deepar_m5.py --checkpoint artifacts\deepar_m5\best.pt --output artifacts\deepar_m5\submission.csv --device auto
 ```
 
+Prediction defaults to deterministic mean decoding. For uncertainty-aware outputs, use sampled paths and summarize them, for example:
+
+```powershell
+python scripts\predict_deepar_m5.py --checkpoint artifacts\deepar_m5\best.pt --output artifacts\deepar_m5\submission_p90.csv --forecast-mode quantile --quantile 0.9 --num-samples 500 --sample-seed 42 --device auto
+```
+
 If the checkpoint was trained on a subset, prediction uses the saved
 `selected_series_ids` from that checkpoint. Those series receive DeepAR model
 forecasts; all other `sample_submission.csv` rows receive a recent-history
 fallback so the output file is complete. The fallback uses the same sales file
 recorded in the checkpoint, avoiding validation/evaluation leakage across the
 two M5 sales files.
+
+Run a hyperparameter sweep with evaluation-holdout metrics:
+
+```powershell
+python scripts\run_deepar_m5_experiments.py --subset-sizes 100 --context-lengths 28,56 --hidden-sizes 16,32 --embedding-dims 4,8 --epochs-list 2 --steps-per-epoch-list 20 --batch-sizes 16 --forecast-modes mean,quantile --quantiles 0.5,0.9 --num-samples 200 --output-dir artifacts\deepar_m5_experiments --device cpu
+```
+
+This trains on `sales_train_validation.csv`, forecasts `d_1914` through `d_1941`, compares against `sales_train_evaluation.csv`, and writes per-run checkpoints, forecasts, holdout metrics, and a `summary.csv`.
+
+Add W&B tracking to compare runs in the dashboard:
+
+```powershell
+python scripts\run_deepar_m5_experiments.py --subset-sizes 100 --context-lengths 28,56 --hidden-sizes 16,32 --embedding-dims 4,8 --epochs-list 2 --steps-per-epoch-list 20 --batch-sizes 16 --forecast-modes mean,quantile --quantiles 0.5,0.9 --num-samples 200 --output-dir artifacts\deepar_m5_experiments --device cpu --wandb --wandb-project m5-competition --wandb-entity ankup25694 --wandb-group deepar-sweep-v1
+```
 
 ## References
 
