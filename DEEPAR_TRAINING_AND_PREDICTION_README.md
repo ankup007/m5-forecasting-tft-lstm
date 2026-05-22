@@ -190,12 +190,7 @@ future steps:
 
 For a 7-day horizon:
 
-$$
-p(z_{t+1:t+7} \mid z_{1:t})
-=
-\prod_{k=1}^{7}
-p(z_{t+k} \mid z_{1:t}, \hat{z}_{t+1:t+k-1}, x_{1:t+7})
-$$
+$$p(z_{t+1:t+7} \mid z_{1:t}) = \prod_{k=1}^{7} p(z_{t+k} \mid z_{1:t}, \hat{z}_{t+1:t+k-1}, x_{1:t+7})$$
 
 This is the autoregressive forecast rollout described by DeepAR.
 
