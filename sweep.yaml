@@ -1,0 +1,38 @@
+program: scripts/train_deepar_m5.py
+method: grid
+metric:
+  name: holdout/bottom_wrmsse
+  goal: minimize
+parameters:
+  # Data selection
+  subset-size:
+    values: [1000]
+  context-length:
+    values: [28, 56]
+  
+  # Architecture
+  hidden-size:
+    values: [32, 64]
+  embedding-dim:
+    values: [8, 16]
+  num-layers:
+    values: [1]
+  
+  # Optimization
+  learning-rate:
+    values: [0.001, 0.0005]
+  batch-size:
+    values: [128]
+  epochs:
+    values: [10]
+  steps-per-epoch:
+    values: [100]
+
+command:
+  - ${interpreter}
+  - ${program}
+  - "--wandb"
+  - "--eval-holdout"
+  - "--sales-file"
+  - "sales_train_validation.csv"
+  - ${args}

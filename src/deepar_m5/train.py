@@ -10,40 +10,19 @@ import torch
 from tqdm import trange
 
 from .data import DataConfig, WindowSampler, config_to_dict, load_m5_bundle, save_json
+from .evaluation import (
+    bottom_level_revenue_weights,
+    compute_holdout_metrics,
+    forecast_selected_series,
+    load_holdout_actuals,
+    write_forecast_csv,
+)
 from .model import DeepAR, ModelConfig, negative_binomial_nll
+from .utils import batch_to_torch, choose_device, configure_logging
 from .wandb_utils import add_wandb_args, init_wandb, wandb_finish, wandb_log, wandb_save
 
 
 logger = logging.getLogger(__name__)
-
-
-def configure_logging(log_level: str) -> None:
-    """Configure process-wide CLI logging with a compact module-aware format."""
-
-    level = getattr(logging, log_level.upper(), None)
-    if not isinstance(level, int):
-        raise ValueError(f"Unknown log level: {log_level}")
-    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
-
-
-def batch_to_torch(batch: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
-    """Move a NumPy batch produced by ``WindowSampler`` onto a PyTorch device."""
-
-    return {
-        "target": torch.as_tensor(batch["target"], dtype=torch.float32, device=device),
-        "covariates": torch.as_tensor(batch["covariates"], dtype=torch.float32, device=device),
-        "static_cats": torch.as_tensor(batch["static_cats"], dtype=torch.long, device=device),
-        "scale": torch.as_tensor(batch["scale"], dtype=torch.float32, device=device),
-        "loss_mask": torch.as_tensor(batch["loss_mask"], dtype=torch.float32, device=device),
-    }
-
-
-def choose_device(device_arg: str) -> torch.device:
-    """Resolve ``auto`` to CUDA when available, otherwise return the requested device."""
-
-    if device_arg == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device_arg)
 
 
 def evaluate(model: DeepAR, sampler: WindowSampler, batch_size: int, device: torch.device) -> float:
@@ -115,6 +94,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-level", default="INFO")
+    # Holdout evaluation arguments
+    parser.add_argument("--eval-holdout", action="store_true", help="Run full competition metric evaluation at end.")
+    parser.add_argument("--forecast-mode", default="mean", choices=["mean", "sample-mean", "quantile"])
+    parser.add_argument("--num-samples", type=int, default=100)
+    parser.add_argument("--quantile", type=float, default=0.5)
+    parser.add_argument("--sample-seed", type=int, default=42)
     add_wandb_args(parser)
     return parser
 
@@ -124,6 +109,23 @@ def main(argv: list[str] | None = None) -> None:
 
     args = build_parser().parse_args(argv)
     configure_logging(args.log_level)
+
+    # Sweep support: wandb.init() might have been called by an agent.
+    # We call init_wandb which returns existing run if already initialized.
+    wandb_run = init_wandb(
+        args,
+        config={
+            **vars(args),
+        },
+    )
+
+    # If running in a sweep, prioritize wandb.config values
+    if wandb_run is not None:
+        for key, value in wandb_run.config.items():
+            if hasattr(args, key):
+                setattr(args, key, value)
+        logger.info("Updated arguments from W&B config: %s", wandb_run.config)
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -155,16 +157,16 @@ def main(argv: list[str] | None = None) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     metrics: list[dict[str, float | int]] = []
     best_val_loss = float("inf")
-    wandb_run = init_wandb(
-        args,
-        config={
-            **vars(args),
+    best_state = None
+
+    # Update W&B with resolved bundle info
+    if wandb_run is not None:
+        wandb_run.config.update({
             "num_series": bundle.num_series,
             "covariate_dim": len(bundle.covariate_columns),
             "cardinalities": bundle.cardinalities,
             "device_resolved": str(device),
-        },
-    )
+        }, allow_val_change=True)
 
     save_json(artifact_dir / "encoders.json", bundle.encoders)
     save_json(artifact_dir / "data_config.json", config_to_dict(data_config))
@@ -229,6 +231,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 save_checkpoint(
                     artifact_dir / "best.pt",
                     model,
@@ -244,6 +247,40 @@ def main(argv: list[str] | None = None) -> None:
             metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
             wandb_save(wandb_run, metrics_path)
             wandb_save(wandb_run, artifact_dir / "best.pt")
+
+        # Optional Holdout Evaluation
+        if args.eval_holdout:
+            logger.info("Running final holdout evaluation")
+            if best_state is not None:
+                model.load_state_dict(best_state)
+            model.eval()
+
+            predictions = forecast_selected_series(
+                model,
+                bundle,
+                data_config,
+                args.batch_size,
+                device,
+                args.forecast_mode,
+                args.num_samples,
+                args.quantile,
+                args.sample_seed,
+            )
+            selected_ids = bundle.sales_frame["id"].astype(str).tolist()
+            actuals = load_holdout_actuals(Path(args.data_dir), args.sales_file, selected_ids, args.prediction_length)
+            weights = bottom_level_revenue_weights(bundle, Path(args.data_dir), args.prediction_length)
+            holdout_metrics = compute_holdout_metrics(predictions, actuals, bundle.sales_values, weights)
+
+            forecasts_path = artifact_dir / "holdout_forecasts.csv"
+            holdout_metrics_path = artifact_dir / "holdout_metrics.json"
+            write_forecast_csv(forecasts_path, selected_ids, predictions, actuals)
+            holdout_metrics_path.write_text(json.dumps(holdout_metrics, indent=2), encoding="utf-8")
+
+            logger.info("Holdout metrics: %s", holdout_metrics)
+            wandb_log(wandb_run, {f"holdout/{k}": v for k, v in holdout_metrics.items() if v is not None})
+            wandb_save(wandb_run, forecasts_path)
+            wandb_save(wandb_run, holdout_metrics_path)
+
     finally:
         wandb_finish(wandb_run)
 

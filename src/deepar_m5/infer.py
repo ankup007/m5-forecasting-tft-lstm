@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from .data import DataConfig, WindowSampler, find_day_columns, load_m5_bundle
 from .model import DeepAR, ModelConfig
-from .train import batch_to_torch, choose_device, configure_logging
+from .utils import batch_to_torch, choose_device, configure_logging
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description="Run DeepAR inference and write an M5 submission file.")
     parser.add_argument("--data-dir", default="m5-forecasting-accuracy")
+    parser.add_argument("--sales-file", default=None, help="Override the sales file used for inference history.")
     parser.add_argument("--checkpoint", default="artifacts/deepar_m5/best.pt")
     parser.add_argument("--output", default="artifacts/deepar_m5/submission.csv")
     parser.add_argument("--batch-size", type=int, default=256)
@@ -99,6 +100,8 @@ def main(argv: list[str] | None = None) -> None:
     checkpoint = load_checkpoint(Path(args.checkpoint), device)
     data_config = DataConfig(**checkpoint["data_config"])
     data_config.data_dir = args.data_dir
+    if args.sales_file:
+        data_config.sales_file = args.sales_file
 
     logger.info("Loading selected series for inference")
     bundle = load_m5_bundle(
