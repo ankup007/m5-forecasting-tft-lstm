@@ -17,25 +17,32 @@ from .model import DeepAR
 logger = logging.getLogger(__name__)
 
 
-def forecast_selected_series(
+def forecast_multi_summaries(
     model: DeepAR,
     bundle,
     data_config: DataConfig,
     batch_size: int,
     device: torch.device,
-    forecast_mode: str,
     num_samples: int,
-    quantile: float,
     sample_seed: int | None,
-) -> np.ndarray:
-    """Forecast all checkpoint-selected series using mean or sampled summaries."""
+) -> dict[str, np.ndarray]:
+    """Efficiently generate multiple forecast types (mean, sample-mean, p25, p75) in one go."""
 
     if sample_seed is not None:
         torch.manual_seed(sample_seed)
+    
     sampler = WindowSampler(bundle, data_config.context_length, data_config.prediction_length, seed=data_config.seed)
-    predictions = np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32)
+    
+    # Pre-allocate containers for all requested summaries
+    results = {
+        "mean": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
+        "sample-mean": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
+        "p25": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
+        "p75": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
+    }
+    
     all_indices = np.arange(bundle.num_series)
-    for offset in tqdm(range(0, bundle.num_series, batch_size), desc="holdout predict", leave=False):
+    for offset in tqdm(range(0, bundle.num_series, batch_size), desc="multi-mode predict", leave=False):
         series_idx = all_indices[offset : offset + batch_size]
         batch_to_move = sampler.make_inference_batch(series_idx)
         batch = {
@@ -45,29 +52,37 @@ def forecast_selected_series(
             "static_cats": torch.as_tensor(batch_to_move["static_cats"], dtype=torch.long, device=device),
             "scale": torch.as_tensor(batch_to_move["scale"], dtype=torch.float32, device=device),
         }
+        
         with torch.no_grad():
-            if forecast_mode == "mean":
-                pred = model.predict_mean(
-                    batch["target"],
-                    batch["covariates"],
-                    batch["static_cats"],
-                    batch["scale"],
-                    context_length=data_config.context_length,
-                    prior_target=batch["prior_target"],
-                )
-            else:
-                samples = model.predict_samples(
-                    batch["target"],
-                    batch["covariates"],
-                    batch["static_cats"],
-                    batch["scale"],
-                    context_length=data_config.context_length,
-                    num_samples=num_samples,
-                    prior_target=batch["prior_target"],
-                )
-                pred = samples.mean(dim=0) if forecast_mode == "sample-mean" else torch.quantile(samples, quantile, dim=0)
-        predictions[series_idx] = pred.clamp_min(0.0).cpu().numpy()
-    return predictions
+            # 1. Analytical Mean
+            pred_mean = model.predict_mean(
+                batch["target"],
+                batch["covariates"],
+                batch["static_cats"],
+                batch["scale"],
+                context_length=data_config.context_length,
+                prior_target=batch["prior_target"],
+            )
+            results["mean"][series_idx] = pred_mean.clamp_min(0.0).cpu().numpy()
+            
+            # 2. Stochastic Samples (do this once)
+            samples = model.predict_samples(
+                batch["target"],
+                batch["covariates"],
+                batch["static_cats"],
+                batch["scale"],
+                context_length=data_config.context_length,
+                num_samples=num_samples,
+                prior_target=batch["prior_target"],
+            )
+            samples = samples.clamp_min(0.0)
+            
+            # 3. Derive stochastic summaries from the same samples
+            results["sample-mean"][series_idx] = samples.mean(dim=0).cpu().numpy()
+            results["p25"][series_idx] = torch.quantile(samples, 0.25, dim=0).cpu().numpy()
+            results["p75"][series_idx] = torch.quantile(samples, 0.75, dim=0).cpu().numpy()
+            
+    return results
 
 
 def load_holdout_actuals(

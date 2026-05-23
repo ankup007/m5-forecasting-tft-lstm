@@ -12,7 +12,7 @@ from tqdm import trange
 from .data import DataConfig, WindowSampler, config_to_dict, load_m5_bundle, save_json
 from .evaluation import (
     compute_holdout_metrics,
-    forecast_selected_series,
+    forecast_multi_summaries,
     load_holdout_actuals,
     write_forecast_csv,
 )
@@ -77,12 +77,138 @@ def save_checkpoint(
     )
 
 
+def train_epoch(
+    model: DeepAR,
+    sampler: WindowSampler,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    steps_per_epoch: int,
+    batch_size: int,
+    grad_clip: float,
+    wandb_run=None,
+) -> float:
+    """Run teacher-forced training for a single epoch and return the mean NLL."""
+
+    model.train()
+    running_loss = 0.0
+    progress = trange(steps_per_epoch, desc=f"epoch {epoch}", leave=False)
+    for step_idx in progress:
+        global_step = (epoch - 1) * steps_per_epoch + step_idx + 1
+        batch_np = sampler.sample_train_batch(batch_size)
+        batch = batch_to_torch(batch_np, device)
+        optimizer.zero_grad(set_to_none=True)
+        mu, alpha = model(
+            batch["target"],
+            batch["covariates"],
+            batch["static_cats"],
+            batch["scale"],
+            prior_target=batch.get("prior_target"),
+        )
+        loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        batch_loss = float(loss.item())
+        running_loss += batch_loss
+        progress.set_postfix(loss=f"{batch_loss:.4f}")
+        wandb_log(
+            wandb_run,
+            {
+                "train/batch_nll": batch_loss,
+                "train/grad_norm": float(grad_norm),
+                "train/epoch": epoch,
+            },
+            step=global_step,
+        )
+    return running_loss / max(steps_per_epoch, 1)
+
+
+def save_artifacts(
+    artifact_dir: Path,
+    bundle,
+    data_config: DataConfig,
+    model: DeepAR,
+) -> None:
+    """Save configuration and metadata files needed for later inference."""
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    save_json(artifact_dir / "encoders.json", bundle.encoders)
+    save_json(artifact_dir / "data_config.json", config_to_dict(data_config))
+    save_json(artifact_dir / "model_config.json", model.to_config_dict())
+    bundle.sales_frame[["id", *["item_id", "dept_id", "cat_id", "store_id", "state_id"]]].to_csv(
+        artifact_dir / "selected_series.csv",
+        index=False,
+    )
+
+
+def run_holdout_evaluation(
+    model: DeepAR,
+    bundle,
+    data_config: DataConfig,
+    artifact_dir: Path,
+    args: argparse.Namespace,
+    device: torch.device,
+    wandb_run=None,
+) -> None:
+    """Run the 12-level competitive evaluation for multiple forecast summaries."""
+
+    logger.info("Running multi-mode holdout evaluation")
+    model.eval()
+
+    # Generate all requested summaries in one efficient pass
+    forecasts_dict = forecast_multi_summaries(
+        model,
+        bundle,
+        data_config,
+        args.batch_size,
+        device,
+        args.num_samples,
+        args.sample_seed,
+    )
+
+    selected_ids = bundle.sales_frame["id"].astype(str).tolist()
+    actuals = load_holdout_actuals(Path(args.data_dir), args.sales_file, selected_ids, args.prediction_length)
+    
+    all_summary_metrics = {}
+
+    for mode, predictions in forecasts_dict.items():
+        logger.info("Computing metrics for mode: %s", mode)
+        holdout_metrics, series_metrics = compute_holdout_metrics(
+            predictions,
+            actuals,
+            bundle.sales_values,
+            bundle,
+            Path(args.data_dir),
+            args.prediction_length,
+        )
+        
+        # Save per-mode artifacts
+        forecasts_path = artifact_dir / f"holdout_forecasts_{mode}.csv"
+        write_forecast_csv(forecasts_path, selected_ids, predictions, actuals, series_metrics)
+        
+        # Add to global summary
+        all_summary_metrics[mode] = holdout_metrics
+        
+        # Log to W&B with mode prefix
+        wandb_log(wandb_run, {f"holdout/{mode}/{k}": v for k, v in holdout_metrics.items() if v is not None})
+        wandb_save(wandb_run, forecasts_path)
+
+    # Save aggregate metrics JSON
+    metrics_path = artifact_dir / "holdout_metrics_all_modes.json"
+    metrics_path.write_text(json.dumps(all_summary_metrics, indent=2), encoding="utf-8")
+    wandb_save(wandb_run, metrics_path)
+
+    # Log primary WRMSSE for easy comparison (using 'mean' as primary)
+    logger.info("Multi-mode holdout complete. Summary (mean WRMSSE): %.5f", all_summary_metrics["mean"]["wrmsse"])
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Define CLI arguments for DeepAR training runs."""
 
     parser = argparse.ArgumentParser(description="Train a from-scratch DeepAR model on M5 data.")
     parser.add_argument("--data-dir", default="m5-forecasting-accuracy")
-    parser.add_argument("--sales-file", default="sales_train_evaluation.csv")
+    parser.add_argument("--sales-file", default="sales_train_validation.csv")
     parser.add_argument("--artifact-dir", default="artifacts/deepar_m5")
     parser.add_argument("--subset-size", type=int, default=1000)
     parser.add_argument("--context-length", type=int, default=56)
@@ -109,27 +235,21 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Train DeepAR on sampled M5 windows and write checkpoints/artifacts."""
+from datetime import datetime
 
-    args = build_parser().parse_args(argv)
-    configure_logging(args.log_level)
-
-    # Sweep support: wandb.init() might have been called by an agent.
-    # We call init_wandb which returns existing run if already initialized.
-    wandb_run = init_wandb(
-        args,
-        config={
-            **vars(args),
-        },
+def generate_run_name(args: argparse.Namespace) -> str:
+    """Create a unique string identifying this run's configuration and timing."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return (
+        f"run_{timestamp}_"
+        f"sub{args.subset_size}_"
+        f"h{args.hidden_size}_"
+        f"lr{args.learning_rate}_"
+        f"ep{args.epochs}"
     )
 
-    # If running in a sweep, prioritize wandb.config values
-    if wandb_run is not None:
-        for key, value in wandb_run.config.items():
-            if hasattr(args, key):
-                setattr(args, key, value)
-        logger.info("Updated arguments from W&B config: %s", wandb_run.config)
+def run_training(args: argparse.Namespace, wandb_run=None) -> tuple[DeepAR, list[dict[str, float | int]]]:
+    """Execute the full training and optional evaluation lifecycle for one configuration."""
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -142,29 +262,32 @@ def main(argv: list[str] | None = None) -> None:
         prediction_length=args.prediction_length,
         seed=args.seed,
     )
-    artifact_dir = Path(args.artifact_dir)
+    
+    # Use the provided artifact_dir. If it's the generic base, add a subfolder.
+    # If experiments.py already gave us a specific subfolder, use it as is.
+    base_artifact_dir = Path(args.artifact_dir)
+    if base_artifact_dir.name.startswith("run_"):
+        artifact_dir = base_artifact_dir
+    else:
+        run_name = generate_run_name(args)
+        artifact_dir = base_artifact_dir / run_name
+    
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Artifacts for this run will be saved to: %s", artifact_dir)
 
-    logger.info("Loading M5 data")
     bundle = load_m5_bundle(data_config)
     sampler = WindowSampler(bundle, args.context_length, args.prediction_length, seed=args.seed)
     device = choose_device(args.device)
 
-    model_config = ModelConfig(
+    model = DeepAR(ModelConfig(
         cardinalities=bundle.cardinalities,
         covariate_dim=len(bundle.covariate_columns),
         hidden_size=args.hidden_size,
         embedding_dim=args.embedding_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
-    )
-    model = DeepAR(model_config).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    metrics: list[dict[str, float | int]] = []
-    best_val_loss = float("inf")
-    best_state = None
+    )).to(device)
 
-    # Update W&B with resolved bundle info
     if wandb_run is not None:
         wandb_run.config.update({
             "num_series": bundle.num_series,
@@ -173,131 +296,60 @@ def main(argv: list[str] | None = None) -> None:
             "device_resolved": str(device),
         }, allow_val_change=True)
 
-    save_json(artifact_dir / "encoders.json", bundle.encoders)
-    save_json(artifact_dir / "data_config.json", config_to_dict(data_config))
-    save_json(artifact_dir / "model_config.json", model.to_config_dict())
-    bundle.sales_frame[["id", *["item_id", "dept_id", "cat_id", "store_id", "state_id"]]].to_csv(
-        artifact_dir / "selected_series.csv",
-        index=False,
-    )
+    save_artifacts(artifact_dir, bundle, data_config, model)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    
+    best_val_loss = float("inf")
+    best_state = None
+    metrics_history = []
 
-    logger.info("Training on %s series, device=%s, covariates=%s", bundle.num_series, device, len(bundle.covariate_columns))
+    logger.info("Training on %s series, device=%s", bundle.num_series, device)
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_epoch(
+            model, sampler, optimizer, device, epoch,
+            args.steps_per_epoch, args.batch_size, args.grad_clip, wandb_run
+        )
+        val_loss = evaluate(model, sampler, args.batch_size, device)
+        
+        logger.info("epoch=%s train_nll=%.5f val_nll=%.5f", epoch, train_loss, val_loss)
+        wandb_log(wandb_run, {"train/epoch_nll": train_loss, "validation/nll": val_loss, "train/epoch": epoch}, 
+                    step=epoch * args.steps_per_epoch)
+
+        metrics_history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+        save_checkpoint(artifact_dir / "latest.pt", model, optimizer, data_config, bundle, epoch, best_val_loss, args)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            save_checkpoint(artifact_dir / "best.pt", model, optimizer, data_config, bundle, epoch, best_val_loss, args)
+
+        (artifact_dir / "metrics.json").write_text(json.dumps(metrics_history, indent=2), encoding="utf-8")
+        wandb_save(wandb_run, artifact_dir / "metrics.json")
+        wandb_save(wandb_run, artifact_dir / "best.pt")
+
+    if args.eval_holdout:
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        run_holdout_evaluation(model, bundle, data_config, artifact_dir, args, device, wandb_run)
+    
+    return model, metrics_history
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Train DeepAR on sampled M5 windows and write checkpoints/artifacts."""
+
+    args = build_parser().parse_args(argv)
+    configure_logging(args.log_level)
+
+    wandb_run = init_wandb(args, config=vars(args))
+    if wandb_run is not None:
+        for key, value in wandb_run.config.items():
+            if hasattr(args, key):
+                setattr(args, key, value)
+        logger.info("Updated arguments from W&B config: %s", wandb_run.config)
+
     try:
-        for epoch in range(1, args.epochs + 1):
-            model.train()
-            running_loss = 0.0
-            progress = trange(args.steps_per_epoch, desc=f"epoch {epoch}", leave=False)
-            for step_idx in progress:
-                global_step = (epoch - 1) * args.steps_per_epoch + step_idx + 1
-                batch_np = sampler.sample_train_batch(args.batch_size)
-                batch = batch_to_torch(batch_np, device)
-                optimizer.zero_grad(set_to_none=True)
-                mu, alpha = model(
-                    batch["target"],
-                    batch["covariates"],
-                    batch["static_cats"],
-                    batch["scale"],
-                    prior_target=batch.get("prior_target"),
-                )
-                loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
-                batch_loss = float(loss.item())
-                running_loss += batch_loss
-                progress.set_postfix(loss=f"{batch_loss:.4f}")
-                wandb_log(
-                    wandb_run,
-                    {
-                        "train/batch_nll": batch_loss,
-                        "train/grad_norm": float(grad_norm),
-                        "train/epoch": epoch,
-                    },
-                    step=global_step,
-                )
-
-            train_loss = running_loss / max(args.steps_per_epoch, 1)
-            val_loss = evaluate(model, sampler, args.batch_size, device)
-            metrics.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-            logger.info("epoch=%s train_nll=%.5f val_nll=%.5f", epoch, train_loss, val_loss)
-            wandb_log(
-                wandb_run,
-                {
-                    "train/epoch_nll": train_loss,
-                    "validation/nll": val_loss,
-                    "train/epoch": epoch,
-                },
-                step=epoch * args.steps_per_epoch,
-            )
-
-            save_checkpoint(
-                artifact_dir / "latest.pt",
-                model,
-                optimizer,
-                data_config,
-                bundle,
-                epoch,
-                best_val_loss,
-                args,
-            )
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                save_checkpoint(
-                    artifact_dir / "best.pt",
-                    model,
-                    optimizer,
-                    data_config,
-                    bundle,
-                    epoch,
-                    best_val_loss,
-                    args,
-                )
-
-            metrics_path = artifact_dir / "metrics.json"
-            metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-            wandb_save(wandb_run, metrics_path)
-            wandb_save(wandb_run, artifact_dir / "best.pt")
-
-        # Optional Holdout Evaluation
-        if args.eval_holdout:
-            logger.info("Running final holdout evaluation")
-            if best_state is not None:
-                model.load_state_dict(best_state)
-            model.eval()
-
-            predictions = forecast_selected_series(
-                model,
-                bundle,
-                data_config,
-                args.batch_size,
-                device,
-                args.forecast_mode,
-                args.num_samples,
-                args.quantile,
-                args.sample_seed,
-            )
-            selected_ids = bundle.sales_frame["id"].astype(str).tolist()
-            actuals = load_holdout_actuals(Path(args.data_dir), args.sales_file, selected_ids, args.prediction_length)
-            holdout_metrics, series_metrics = compute_holdout_metrics(
-                predictions,
-                actuals,
-                bundle.sales_values,
-                bundle,
-                Path(args.data_dir),
-                args.prediction_length,
-            )
-
-            forecasts_path = artifact_dir / "holdout_forecasts.csv"
-            holdout_metrics_path = artifact_dir / "holdout_metrics.json"
-            write_forecast_csv(forecasts_path, selected_ids, predictions, actuals, series_metrics)
-            holdout_metrics_path.write_text(json.dumps(holdout_metrics, indent=2), encoding="utf-8")
-
-            logger.info("Holdout metrics: %s", holdout_metrics)
-            wandb_log(wandb_run, {f"holdout/{k}": v for k, v in holdout_metrics.items() if v is not None})
-            wandb_save(wandb_run, forecasts_path)
-            wandb_save(wandb_run, holdout_metrics_path)
-
+        run_training(args, wandb_run)
     finally:
         wandb_finish(wandb_run)
 

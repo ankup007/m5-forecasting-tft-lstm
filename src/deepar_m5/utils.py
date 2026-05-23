@@ -22,13 +22,17 @@ def configure_logging(log_level: str) -> None:
 def batch_to_torch(batch: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:
     """Move a NumPy batch produced by ``WindowSampler`` onto a PyTorch device."""
 
-    return {
+    torch_batch = {
         "target": torch.as_tensor(batch["target"], dtype=torch.float32, device=device),
         "covariates": torch.as_tensor(batch["covariates"], dtype=torch.float32, device=device),
         "static_cats": torch.as_tensor(batch["static_cats"], dtype=torch.long, device=device),
         "scale": torch.as_tensor(batch["scale"], dtype=torch.float32, device=device),
-        "loss_mask": torch.as_tensor(batch.get("loss_mask", batch.get("target")), dtype=torch.float32, device=device),
+        "loss_mask": torch.as_tensor(batch.get("loss_mask", batch["target"]), dtype=torch.float32, device=device),
     }
+    if "prior_target" in batch:
+        torch_batch["prior_target"] = torch.as_tensor(batch["prior_target"], dtype=torch.float32, device=device)
+    
+    return torch_batch
 
 
 def choose_device(device_arg: str) -> torch.device:
