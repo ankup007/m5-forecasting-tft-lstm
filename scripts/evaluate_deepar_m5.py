@@ -10,7 +10,6 @@ import torch
 
 from deepar_m5.data import DataConfig, load_m5_bundle
 from deepar_m5.evaluation import (
-    bottom_level_revenue_weights,
     compute_holdout_metrics,
     forecast_selected_series,
     load_holdout_actuals,
@@ -89,14 +88,20 @@ def main(argv: list[str] | None = None) -> None:
     actuals = load_holdout_actuals(Path(args.data_dir), args.sales_file, selected_ids, data_config.prediction_length)
     
     logger.info("Computing metrics")
-    weights = bottom_level_revenue_weights(bundle, Path(args.data_dir), data_config.prediction_length)
-    metrics = compute_holdout_metrics(predictions, actuals, bundle.sales_values, weights)
+    metrics, series_metrics = compute_holdout_metrics(
+        predictions,
+        actuals,
+        bundle.sales_values,
+        bundle,
+        Path(args.data_dir),
+        data_config.prediction_length,
+    )
 
     # Save results
     forecasts_path = output_dir / "eval_forecasts.csv"
     metrics_path = output_dir / "eval_metrics.json"
     
-    write_forecast_csv(forecasts_path, selected_ids, predictions, actuals)
+    write_forecast_csv(forecasts_path, selected_ids, predictions, actuals, series_metrics)
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     logger.info("Evaluation complete. Metrics: %s", metrics)

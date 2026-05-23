@@ -471,8 +471,17 @@ class WindowSampler:
         positions = start + np.arange(self.sequence_length)
         targets = np.zeros((len(series_idx), self.sequence_length), dtype=np.float32)
         targets[:, : self.context_length] = self.bundle.sales_values[series_idx, start:forecast_start]
+
+        # Extract target from the day before the window starts (prior_target)
+        # If start == 0, there is no prior history, so we use zero.
+        if start > 0:
+            prior_target = self.bundle.sales_values[series_idx, start - 1]
+        else:
+            prior_target = np.zeros(len(series_idx), dtype=np.float32)
+
         batch = {
             "target": targets,
+            "prior_target": prior_target,
             "covariates": self.bundle.covariates[series_idx[:, None], positions[None, :]],
             "static_cats": self.bundle.static_cats[series_idx],
             "scale": self.bundle.scales[series_idx, None],
@@ -502,10 +511,19 @@ class WindowSampler:
         offsets = np.arange(self.sequence_length)
         positions = starts[:, None] + offsets[None, :]
         targets = self.bundle.sales_values[series_idx[:, None], positions]
+
+        # Extract target from the day before each window starts (prior_target)
+        # For each sample in the batch, check if its start index allows for a prior day.
+        prior_target = np.zeros(len(series_idx), dtype=np.float32)
+        for i, (s_idx, start) in enumerate(zip(series_idx, starts)):
+            if start > 0:
+                prior_target[i] = self.bundle.sales_values[s_idx, start - 1]
+
         loss_mask = np.zeros_like(targets, dtype=np.float32)
         loss_mask[:, self.context_length :] = 1.0
         return {
             "target": targets.astype(np.float32),
+            "prior_target": prior_target.astype(np.float32),
             "covariates": self.bundle.covariates[series_idx[:, None], positions].astype(np.float32),
             "static_cats": self.bundle.static_cats[series_idx].astype(np.int64),
             "scale": self.bundle.scales[series_idx, None].astype(np.float32),
@@ -517,9 +535,10 @@ class WindowSampler:
         """Log the tensor-like shapes in a sampled batch for debugging."""
 
         logger.debug(
-            "%s batch shapes: target=%s covariates=%s static_cats=%s scale=%s loss_mask=%s series_idx=%s",
+            "%s batch shapes: target=%s prior_target=%s covariates=%s static_cats=%s scale=%s loss_mask=%s series_idx=%s",
             name,
             batch["target"].shape,
+            batch.get("prior_target", np.array([])).shape,
             batch["covariates"].shape,
             batch["static_cats"].shape,
             batch["scale"].shape,

@@ -60,7 +60,13 @@ def main(argv: list[str] | None = None) -> None:
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     batch = batch_to_torch(sampler.sample_train_batch(args.batch_size), device)
-    mu, alpha = model(batch["target"], batch["covariates"], batch["static_cats"], batch["scale"])
+    mu, alpha = model(
+        batch["target"],
+        batch["covariates"],
+        batch["static_cats"],
+        batch["scale"],
+        prior_target=batch.get("prior_target"),
+    )
     loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
     assert torch.isfinite(loss), "loss is not finite"
     assert mu.shape == batch["target"].shape
@@ -75,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
         infer_batch["static_cats"],
         infer_batch["scale"],
         context_length=args.context_length,
+        prior_target=infer_batch.get("prior_target"),
     )
     assert pred.shape == (min(3, bundle.num_series), args.prediction_length)
     assert torch.all(pred >= 0)
@@ -85,6 +92,7 @@ def main(argv: list[str] | None = None) -> None:
         infer_batch["scale"],
         context_length=args.context_length,
         num_samples=4,
+        prior_target=infer_batch.get("prior_target"),
     )
     assert samples.shape == (4, min(3, bundle.num_series), args.prediction_length)
     assert torch.all(samples >= 0)

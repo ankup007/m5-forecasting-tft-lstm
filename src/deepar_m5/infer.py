@@ -135,6 +135,7 @@ def main(argv: list[str] | None = None) -> None:
                     batch["static_cats"],
                     batch["scale"],
                     context_length=data_config.context_length,
+                    prior_target=batch.get("prior_target"),
                 )
             else:
                 samples = model.predict_samples(
@@ -144,6 +145,7 @@ def main(argv: list[str] | None = None) -> None:
                     batch["scale"],
                     context_length=data_config.context_length,
                     num_samples=args.num_samples,
+                    prior_target=batch.get("prior_target"),
                 )
                 if args.forecast_mode == "sample-mean":
                     pred = samples.mean(dim=0)

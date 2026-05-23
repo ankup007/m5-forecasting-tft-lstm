@@ -40,6 +40,7 @@ def forecast_selected_series(
         batch_to_move = sampler.make_inference_batch(series_idx)
         batch = {
             "target": torch.as_tensor(batch_to_move["target"], dtype=torch.float32, device=device),
+            "prior_target": torch.as_tensor(batch_to_move["prior_target"], dtype=torch.float32, device=device),
             "covariates": torch.as_tensor(batch_to_move["covariates"], dtype=torch.float32, device=device),
             "static_cats": torch.as_tensor(batch_to_move["static_cats"], dtype=torch.long, device=device),
             "scale": torch.as_tensor(batch_to_move["scale"], dtype=torch.float32, device=device),
@@ -52,6 +53,7 @@ def forecast_selected_series(
                     batch["static_cats"],
                     batch["scale"],
                     context_length=data_config.context_length,
+                    prior_target=batch["prior_target"],
                 )
             else:
                 samples = model.predict_samples(
@@ -61,6 +63,7 @@ def forecast_selected_series(
                     batch["scale"],
                     context_length=data_config.context_length,
                     num_samples=num_samples,
+                    prior_target=batch["prior_target"],
                 )
                 pred = samples.mean(dim=0) if forecast_mode == "sample-mean" else torch.quantile(samples, quantile, dim=0)
         predictions[series_idx] = pred.clamp_min(0.0).cpu().numpy()
@@ -105,21 +108,74 @@ def rmsse_denominators(train_values: np.ndarray) -> np.ndarray:
 
     diffs = np.diff(train_values.astype(np.float64), axis=1)
     denom = np.mean(np.square(diffs), axis=1)
-    positive = denom > 0
-    if positive.any():
-        fallback = float(np.median(denom[positive]))
-    else:
-        fallback = 1.0
-    return np.where(positive, denom, fallback).astype(np.float64)
+    # Floor at 1e-12 to avoid division by zero for flat series.
+    return np.clip(denom, 1e-12, None)
 
 
-def bottom_level_revenue_weights(bundle, data_dir: Path, prediction_length: int) -> np.ndarray:
-    """Compute bottom-level dollar-sales weights over the last training horizon."""
+def _aggregate_to_levels(
+    values: np.ndarray,
+    sales_frame: pd.DataFrame,
+) -> list[np.ndarray]:
+    """Aggregate bottom-level series (Level 12) up to all 12 hierarchical levels."""
 
+    levels = [
+        [],  # Level 1: Total
+        ["state_id"],  # Level 2
+        ["store_id"],  # Level 3
+        ["cat_id"],  # Level 4
+        ["dept_id"],  # Level 5
+        ["state_id", "cat_id"],  # Level 6
+        ["state_id", "dept_id"],  # Level 7
+        ["store_id", "cat_id"],  # Level 8
+        ["store_id", "dept_id"],  # Level 9
+        ["item_id"],  # Level 10
+        ["item_id", "state_id"],  # Level 11
+        ["item_id", "store_id"],  # Level 12 (bottom)
+    ]
+
+    aggregated = []
+    for level_cols in levels:
+        if not level_cols:
+            # Level 1: Sum everything into a single series
+            aggregated.append(values.sum(axis=0, keepdims=True))
+        elif level_cols == ["item_id", "store_id"]:
+            # Level 12: Already at the bottom level
+            aggregated.append(values)
+        else:
+            # Group and sum based on the specified columns
+            temp_df = sales_frame[level_cols].copy()
+            # Use a dummy column to ensure we can group and sum the numpy array correctly
+            # Actually, it's safer to use pandas grouping directly on the values
+            # We convert values to a temporary DataFrame for easy aggregation
+            val_df = pd.DataFrame(values)
+            combined = pd.concat([temp_df, val_df], axis=1)
+            agg_df = combined.groupby(level_cols, sort=True).sum()
+            aggregated.append(agg_df.to_numpy(dtype=np.float64))
+
+    return aggregated
+
+
+def compute_holdout_metrics(
+    predictions: np.ndarray,
+    actuals: np.ndarray,
+    train_values: np.ndarray,
+    bundle,
+    data_dir: Path,
+    prediction_length: int,
+) -> dict:
+    """Compute 12-level WRMSSE and other holdout metrics for the M5 competition."""
+
+    # 1. Aggregate unit sales to all 12 levels
+    pred_levels = _aggregate_to_levels(predictions.astype(np.float64), bundle.sales_frame)
+    actual_levels = _aggregate_to_levels(actuals.astype(np.float64), bundle.sales_frame)
+    train_levels = _aggregate_to_levels(train_values.astype(np.float64), bundle.sales_frame)
+
+    # 2. Compute Revenue for each bottom-level series (Level 12)
+    # Revenue is calculated over the last 28 days of training data
     day_columns = bundle.day_columns[-prediction_length:]
-    sales = bundle.sales_frame[["id", "item_id", "store_id", *day_columns]].copy()
+    sales = bundle.sales_frame[["item_id", "store_id", *day_columns]].copy()
     long_sales = sales.melt(
-        id_vars=["id", "item_id", "store_id"],
+        id_vars=["item_id", "store_id"],
         value_vars=day_columns,
         var_name="d",
         value_name="units",
@@ -130,48 +186,122 @@ def bottom_level_revenue_weights(bundle, data_dir: Path, prediction_length: int)
     long_sales = long_sales.merge(prices, on=["store_id", "item_id", "wm_yr_wk"], how="left")
     long_sales["sell_price"] = long_sales["sell_price"].fillna(0.0)
     long_sales["revenue"] = long_sales["units"].astype(float) * long_sales["sell_price"].astype(float)
-    revenue = long_sales.groupby("id", sort=False)["revenue"].sum().reindex(bundle.sales_frame["id"]).fillna(0.0)
-    weights = revenue.to_numpy(dtype=np.float64)
-    total = float(weights.sum())
-    if total <= 0:
-        return np.full(len(weights), 1.0 / max(len(weights), 1), dtype=np.float64)
-    return weights / total
+    
+    # Bottom-level revenue
+    bottom_revenue = long_sales.groupby(["item_id", "store_id"], sort=True)["revenue"].sum()
+    # Ensure it aligns with Level 12 series order
+    # Level 12 was aggregated using groupby(["item_id", "store_id"], sort=True) in _aggregate_to_levels
+    # But wait, bundle.sales_frame is already Level 12. 
+    # Let's just calculate revenue for each row in bundle.sales_frame.
+    
+    row_revenue = []
+    # Faster way to get revenue per row
+    rev_per_item_store = bottom_revenue.to_dict()
+    for row in bundle.sales_frame.itertuples():
+        row_revenue.append(rev_per_item_store.get((row.item_id, row.store_id), 0.0))
+    row_revenue = np.array(row_revenue, dtype=np.float64)
 
+    # 3. Aggregate revenue to all levels and compute weights
+    # weights for each level must sum to 1. Total WRMSSE is mean of level-WRMSSEs.
+    revenue_levels = _aggregate_to_levels(row_revenue[:, None], bundle.sales_frame)
+    
+    level_rmsses = []
+    level_wrmsses = []
+    
+    for l_idx in range(12):
+        p = pred_levels[l_idx]
+        a = actual_levels[l_idx]
+        t = train_levels[l_idx]
+        r = revenue_levels[l_idx].flatten()
+        
+        # Weights for this level
+        w = r / np.sum(r).clip(min=1e-12)
+        
+        # RMSSE for each series in this level
+        mse = np.mean(np.square(p - a), axis=1)
+        denom = rmsse_denominators(t)
+        rmsse = np.sqrt(mse / denom)
+        
+        level_rmsses.append(float(np.mean(rmsse)))
+        level_wrmsses.append(float(np.sum(w * rmsse)))
 
-def compute_holdout_metrics(predictions: np.ndarray, actuals: np.ndarray, train_values: np.ndarray, weights: np.ndarray) -> dict:
-    """Compute bottom-level holdout metrics for one experiment run."""
+    # Final WRMSSE is the average across all 12 levels
+    wrmsse = float(np.mean(level_wrmsses))
 
-    pred = predictions.astype(np.float64)
-    actual = actuals.astype(np.float64)
-    error = pred - actual
-    abs_error = np.abs(error)
-    nonzero = actual != 0
-    smape_denom = np.abs(actual) + np.abs(pred)
-    smape_values = np.zeros_like(abs_error, dtype=np.float64)
-    np.divide(2.0 * abs_error, smape_denom, out=smape_values, where=smape_denom > 0)
-    rmsse_denom = rmsse_denominators(train_values)
-    per_series_rmsse = np.sqrt(np.mean(np.square(error), axis=1) / np.clip(rmsse_denom, 1e-12, None))
+    # Calculate basic bottom-level metrics (Level 12) per series
+    pred_b = predictions.astype(np.float64)
+    actual_b = actuals.astype(np.float64)
+    error_b = pred_b - actual_b
+    abs_error_b = np.abs(error_b)
+    
+    # Per-series metrics
+    series_mae = np.mean(abs_error_b, axis=1)
+    series_rmse = np.sqrt(np.mean(np.square(error_b), axis=1))
+    
+    smape_denom_b = np.abs(actual_b) + np.abs(pred_b)
+    smape_values_b = np.zeros_like(abs_error_b, dtype=np.float64)
+    np.divide(2.0 * abs_error_b, smape_denom_b, out=smape_values_b, where=smape_denom_b > 0)
+    series_smape = np.mean(smape_values_b, axis=1)
+    
+    # MAPE (only defined where actual > 0)
+    mape_values = np.zeros_like(abs_error_b, dtype=np.float64)
+    np.divide(abs_error_b, actual_b, out=mape_values, where=actual_b > 0)
+    # For series-level MAPE, we can either take mean of available days or handle fully zero actuals
+    series_mape = np.array([
+        np.mean(mape_values[i][actual_b[i] > 0]) if np.any(actual_b[i] > 0) else np.nan 
+        for i in range(len(actual_b))
+    ])
+
+    # RMSSE (Level 12)
+    denom_b = rmsse_denominators(train_values.astype(np.float64))
+    series_rmsse = np.sqrt(np.mean(np.square(error_b), axis=1) / denom_b)
 
     metrics = {
-        "mae": float(abs_error.mean()),
-        "rmse": float(np.sqrt(np.mean(np.square(error)))),
-        "wape": float(abs_error.sum() / max(float(np.abs(actual).sum()), 1e-12)),
-        "smape": float(np.mean(smape_values)),
-        "mape_nonzero": float(np.mean(abs_error[nonzero] / actual[nonzero])) if nonzero.any() else None,
-        "rmsse": float(np.mean(per_series_rmsse)),
-        "bottom_wrmsse": float(np.sum(weights * per_series_rmsse)),
-        "num_series": int(pred.shape[0]),
-        "prediction_length": int(pred.shape[1]),
+        "wrmsse": wrmsse,
+        "rmsse_l12": level_rmsses[11],
+        "wrmsse_l12": level_wrmsses[11],
+        "mae": float(abs_error_b.mean()),
+        "rmse": float(np.sqrt(np.mean(np.square(error_b)))),
+        "wape": float(abs_error_b.sum() / max(float(np.abs(actual_b).sum()), 1e-12)),
+        "smape": float(np.mean(smape_values_b)),
+        "num_series": int(pred_b.shape[0]),
+        "prediction_length": int(pred_b.shape[1]),
     }
-    return metrics
+    # Add all level WRMSSEs for detailed analysis
+    for i, val in enumerate(level_wrmsses):
+        metrics[f"wrmsse_l{i+1}"] = val
 
-def write_forecast_csv(path: Path, selected_ids: list[str], predictions: np.ndarray, actuals: np.ndarray) -> None:
-    """Write selected-series forecasts and actuals for later error analysis."""
+    # Per-series breakdown for saving to CSV
+    series_metrics = pd.DataFrame({
+        "mae": series_mae,
+        "rmse": series_rmse,
+        "smape": series_smape,
+        "mape": series_mape,
+        "rmsse": series_rmsse,
+    })
+
+    return metrics, series_metrics
+
+def write_forecast_csv(
+    path: Path, 
+    selected_ids: list[str], 
+    predictions: np.ndarray, 
+    actuals: np.ndarray,
+    series_metrics: pd.DataFrame | None = None,
+) -> None:
+    """Write selected-series forecasts, actuals, and metrics for error analysis."""
 
     forecast_columns = [f"F{i}" for i in range(1, predictions.shape[1] + 1)]
     actual_columns = [f"actual_F{i}" for i in range(1, actuals.shape[1] + 1)]
     frame = pd.DataFrame({"id": selected_ids})
     frame[forecast_columns] = pd.DataFrame(predictions, index=frame.index)
     frame[actual_columns] = pd.DataFrame(actuals, index=frame.index)
+    
+    if series_metrics is not None:
+        # Prefix metric columns to distinguish them from forecasts
+        metric_cols = series_metrics.copy()
+        metric_cols.columns = [f"metric_{c}" for c in metric_cols.columns]
+        frame = pd.concat([frame, metric_cols], axis=1)
+
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False)

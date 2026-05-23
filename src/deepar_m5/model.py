@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,6 +41,10 @@ class ScratchLSTMCell(nn.Module):
         nn.init.xavier_uniform_(self.weight_ih)
         nn.init.orthogonal_(self.weight_hh)
         nn.init.zeros_(self.bias)
+        # --- initializing bias with 1 ---
+        # Since gates are ordered i, f, g, o: index 1 targets the forget gate
+        with torch.no_grad():
+            self.bias.chunk(4, dim=-1)[1].fill_(1.0)
 
     def forward(self, x: torch.Tensor, state: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one LSTM step and return the next hidden and cell states."""
@@ -63,13 +69,21 @@ class DeepAR(nn.Module):
 
         super().__init__()
         self.config = config
+        #  a helper function for the fast.ai heuristic
+        def get_emb_dim(cardinality: int) -> int:
+            return min(50, (cardinality + 1) // 2)
+        
         self.embeddings = nn.ModuleList(
-            [nn.Embedding(cardinality, config.embedding_dim) for cardinality in config.cardinalities]
-        )
-        static_dim = len(config.cardinalities) * config.embedding_dim
+                [nn.Embedding(c, get_emb_dim(c)) for c in config.cardinalities]
+            )
+        # self.embeddings = nn.ModuleList(
+        #     [nn.Embedding(cardinality, config.embedding_dim) for cardinality in config.cardinalities]
+        # )
+        static_dim = sum(get_emb_dim(c) for c in config.cardinalities)
+        #static_dim = len(config.cardinalities) * config.embedding_dim
         input_size = 1 + config.covariate_dim + static_dim + 1
 
-        cells = []
+        cells = [] 
         for layer_idx in range(config.num_layers):
             cells.append(
                 ScratchLSTMCell(
@@ -109,6 +123,7 @@ class DeepAR(nn.Module):
         """Run one autoregressive step and produce negative-binomial parameters."""
 
         x = torch.cat([prev_scaled_target, covariates_t, static_emb, log_scale], dim=-1)
+        logger.info(f"x shape: {x.shape}")
         next_states = []
         for layer_idx, cell in enumerate(self.cells):
             h, c = cell(x, states[layer_idx])
@@ -116,6 +131,7 @@ class DeepAR(nn.Module):
             next_states.append((h, c))
 
         raw = self.output(x)
+        logger.info(f"raw shape: {raw.shape}")
         mu_scaled = F.softplus(raw[:, :1]) + 1e-4
         alpha = F.softplus(raw[:, 1:2]) + 1e-4
         return mu_scaled, alpha, next_states
@@ -126,18 +142,31 @@ class DeepAR(nn.Module):
         covariates: torch.Tensor,
         static_cats: torch.Tensor,
         scale: torch.Tensor,
+        prior_target: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run teacher-forced training over a full context-plus-horizon window."""
 
         batch_size, seq_len = target.shape
+        logger.info(f"target_shape: {target.shape}")
+        logger.info(f"batch_size: {batch_size}, seq_len: {seq_len}")
+        logger.info(f"shape static_cats: {static_cats.shape}")
         static_emb = self.static_embedding(static_cats)
+        logger.info(f"shape static_embed: {static_emb.shape}")
+        logger.info(f"shape scale: {scale.shape}")
         log_scale = torch.log1p(scale)
         states = self.initial_state(batch_size, target.device)
+        logger.info(f"initial states shape: {len(states)}")
 
-        prev_scaled = torch.zeros(batch_size, 1, device=target.device)
+        if prior_target is not None:
+            prev_scaled = prior_target.unsqueeze(1) / scale.clamp_min(1e-4)
+        else:
+            logger.info("prior target is not given - forecasts will be affected!!!")
+            prev_scaled = torch.zeros(batch_size, 1, device=target.device)
+        
         mus = []
         alphas = []
         for step in range(seq_len):
+            logger.info(f"processing: step: {step}/{seq_len}")
             mu_scaled, alpha, states = self._step(
                 prev_scaled,
                 covariates[:, step, :],
@@ -159,6 +188,7 @@ class DeepAR(nn.Module):
         static_cats: torch.Tensor,
         scale: torch.Tensor,
         context_length: int,
+        prior_target: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode future means autoregressively after consuming known context."""
 
@@ -167,7 +197,12 @@ class DeepAR(nn.Module):
         log_scale = torch.log1p(scale)
         states = self.initial_state(batch_size, target.device)
 
-        prev_scaled = torch.zeros(batch_size, 1, device=target.device)
+        if prior_target is not None:
+            prev_scaled = prior_target.unsqueeze(1) / scale.clamp_min(1e-4)
+        else:
+            logger.info("prior target is not given - forecasts will be affected!!!")
+            prev_scaled = torch.zeros(batch_size, 1, device=target.device)
+
         predictions = []
         for step in range(seq_len):
             mu_scaled, _, states = self._step(
@@ -195,32 +230,65 @@ class DeepAR(nn.Module):
         scale: torch.Tensor,
         context_length: int,
         num_samples: int,
+        prior_target: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Decode future sample paths from the predicted Negative Binomial distributions.
-
-        The context portion uses observed targets exactly like ``predict_mean``.
-        Once the horizon starts, each sample path draws from the model's
-        predicted count distribution and feeds that sampled value into the next
-        autoregressive step. The result shape is
-        ``(num_samples, batch, prediction_length)``.
-        """
+        """Optimized decoding that avoids redundant context computation."""
 
         if num_samples <= 0:
             raise ValueError("num_samples must be positive")
 
         batch_size, seq_len = target.shape
-        repeated_target = target.repeat_interleave(num_samples, dim=0)
-        repeated_covariates = covariates.repeat_interleave(num_samples, dim=0)
-        repeated_static_cats = static_cats.repeat_interleave(num_samples, dim=0)
-        repeated_scale = scale.repeat_interleave(num_samples, dim=0)
+        horizon_length = seq_len - context_length
 
-        static_emb = self.static_embedding(repeated_static_cats)
-        log_scale = torch.log1p(repeated_scale)
-        states = self.initial_state(batch_size * num_samples, target.device)
+        # ------------------------------------------------------------------
+        # PHASE 1: CONSUME CONTEXT (NO DUPLICATION YET)
+        # ------------------------------------------------------------------
+        static_emb = self.static_embedding(static_cats)
+        log_scale = torch.log1p(scale)
+        states = self.initial_state(batch_size, target.device)
+        
+        if prior_target is not None:
+            prev_scaled = prior_target.unsqueeze(1) / scale.clamp_min(1e-4)
+        else:
+            logger.info("prior target is not given - forecasts will be affected!!!")
+            prev_scaled = torch.zeros(batch_size, 1, device=target.device)
 
-        prev_scaled = torch.zeros(batch_size * num_samples, 1, device=target.device)
+        # Walk through the known history efficiently (only processing `batch_size`)
+        for step in range(context_length):
+            mu_scaled, alpha, states = self._step(
+                prev_scaled,
+                covariates[:, step, :],
+                static_emb,
+                log_scale,
+                states,
+            )
+            prev_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+
+        # ------------------------------------------------------------------
+        # THE SPLIT: CLONE THE WORLD INTO `num_samples` PARALLEL UNIVERSES
+        # ------------------------------------------------------------------
+        # We clone the final context states. Instead of 32 sequences, we now have 3200.
+        def duplicate(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.repeat_interleave(num_samples, dim=0)
+
+        # Duplicate the LSTM hidden and cell states for every layer
+        expanded_states = []
+        for h, c in states:
+            expanded_states.append((duplicate(h), duplicate(c)))
+        states = expanded_states
+
+        # Duplicate the inputs for the horizon
+        prev_scaled = duplicate(prev_scaled)
+        static_emb = duplicate(static_emb)
+        log_scale = duplicate(log_scale)
+        repeated_scale = duplicate(scale)
+        repeated_covariates = duplicate(covariates[:, context_length:, :])
+
+        # ------------------------------------------------------------------
+        # PHASE 2: HORIZON GENERATION (WITH DUPLICATES)
+        # ------------------------------------------------------------------
         samples = []
-        for step in range(seq_len):
+        for step in range(horizon_length):
             mu_scaled, alpha, states = self._step(
                 prev_scaled,
                 repeated_covariates[:, step, :],
@@ -228,13 +296,13 @@ class DeepAR(nn.Module):
                 log_scale,
                 states,
             )
-            if step >= context_length:
-                mu = mu_scaled * repeated_scale
-                sample = sample_negative_binomial(mu, alpha)
-                samples.append(sample)
-                prev_scaled = sample / repeated_scale.clamp_min(1e-4)
-            else:
-                prev_scaled = repeated_target[:, step : step + 1] / repeated_scale.clamp_min(1e-4)
+            
+            mu = mu_scaled * repeated_scale
+            sample = sample_negative_binomial(mu, alpha)
+            samples.append(sample)
+            
+            # Feed the random sample back in for the next autoregressive step
+            prev_scaled = sample / repeated_scale.clamp_min(1e-4)
 
         stacked = torch.cat(samples, dim=1)
         return stacked.view(batch_size, num_samples, -1).transpose(0, 1).contiguous()

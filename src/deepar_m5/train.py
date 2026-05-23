@@ -11,7 +11,6 @@ from tqdm import trange
 
 from .data import DataConfig, WindowSampler, config_to_dict, load_m5_bundle, save_json
 from .evaluation import (
-    bottom_level_revenue_weights,
     compute_holdout_metrics,
     forecast_selected_series,
     load_holdout_actuals,
@@ -34,7 +33,13 @@ def evaluate(model: DeepAR, sampler: WindowSampler, batch_size: int, device: tor
     with torch.no_grad():
         for batch_np in sampler.iter_validation_batches(batch_size):
             batch = batch_to_torch(batch_np, device)
-            mu, alpha = model(batch["target"], batch["covariates"], batch["static_cats"], batch["scale"])
+            mu, alpha = model(
+                batch["target"],
+                batch["covariates"],
+                batch["static_cats"],
+                batch["scale"],
+                prior_target=batch.get("prior_target"),
+            )
             loss_sum = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
             weight = float(batch["loss_mask"].sum().item())
             total_loss += float(loss_sum.item()) * weight
@@ -187,7 +192,13 @@ def main(argv: list[str] | None = None) -> None:
                 batch_np = sampler.sample_train_batch(args.batch_size)
                 batch = batch_to_torch(batch_np, device)
                 optimizer.zero_grad(set_to_none=True)
-                mu, alpha = model(batch["target"], batch["covariates"], batch["static_cats"], batch["scale"])
+                mu, alpha = model(
+                    batch["target"],
+                    batch["covariates"],
+                    batch["static_cats"],
+                    batch["scale"],
+                    prior_target=batch.get("prior_target"),
+                )
                 loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -268,12 +279,18 @@ def main(argv: list[str] | None = None) -> None:
             )
             selected_ids = bundle.sales_frame["id"].astype(str).tolist()
             actuals = load_holdout_actuals(Path(args.data_dir), args.sales_file, selected_ids, args.prediction_length)
-            weights = bottom_level_revenue_weights(bundle, Path(args.data_dir), args.prediction_length)
-            holdout_metrics = compute_holdout_metrics(predictions, actuals, bundle.sales_values, weights)
+            holdout_metrics, series_metrics = compute_holdout_metrics(
+                predictions,
+                actuals,
+                bundle.sales_values,
+                bundle,
+                Path(args.data_dir),
+                args.prediction_length,
+            )
 
             forecasts_path = artifact_dir / "holdout_forecasts.csv"
             holdout_metrics_path = artifact_dir / "holdout_metrics.json"
-            write_forecast_csv(forecasts_path, selected_ids, predictions, actuals)
+            write_forecast_csv(forecasts_path, selected_ids, predictions, actuals, series_metrics)
             holdout_metrics_path.write_text(json.dumps(holdout_metrics, indent=2), encoding="utf-8")
 
             logger.info("Holdout metrics: %s", holdout_metrics)
