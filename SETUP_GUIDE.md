@@ -73,9 +73,23 @@ Per run, the following are written:
 streamlit run scripts\experiment_dashboard.py
 ```
 
-Use the sidebar to pick a summary file, a run, a series, and a forecast variant. The dashboard shows run-level aggregate metrics and per-series holdout plots for the available forecast modes.
+Use the sidebar to pick a summary file, a run, a series, and a forecast variant. The dashboard prefers the JSON artifacts under `series_json/` when they exist, and falls back to CSVs for older runs.
 
-## 6. Evaluation mode
+## 6. Build JSON artifacts for a run
+
+```powershell
+python scripts\build_series_json_artifacts.py --summary-file artifacts\deepar_m5_experiments\summary_YYYYMMDD_HHMMSS_ffffff.csv --run-name run_YYYYMMDD_HHMMSS_ffffff_001_subset100_ctx56_h16_emb8_ep5_steps10_mean
+```
+
+This creates:
+
+- `series_json/run_summary.json`
+- `series_json/series_index.json`
+- `series_json/series/<series_id>.json`
+
+These JSON files are what the dashboard loads for fast per-series viewing and public sharing.
+
+## 7. Evaluation mode
 
 ```powershell
 python scripts\evaluate_deepar_m5.py --checkpoint artifacts\my_run\best.pt --sales-file sales_train_evaluation.csv --output-dir evaluations\test_run
@@ -83,7 +97,7 @@ python scripts\evaluate_deepar_m5.py --checkpoint artifacts\my_run\best.pt --sal
 
 This writes evaluation metrics and forecast CSV files for the checkpoint.
 
-## 7. Prediction mode
+## 8. Prediction mode
 
 ```powershell
 python scripts\predict_deepar_m5.py --checkpoint artifacts\my_run\best.pt --output predictions\submission_v1.csv
@@ -95,7 +109,7 @@ For quantile or sample-based forecasts:
 python scripts\predict_deepar_m5.py --checkpoint artifacts\my_run\best.pt --output predictions\submission_p90.csv --forecast-mode quantile --quantile 0.9 --num-samples 500 --sample-seed 42
 ```
 
-## 8. Weights & Biases
+## 9. Weights & Biases
 
 Enable W&B with the CLI flag:
 
@@ -105,7 +119,7 @@ python scripts\run_deepar_m5_experiments.py --wandb
 
 The script itself preconfigures the W&B project, group, tags, and mode defaults.
 
-## 9. Full argument reference
+## 10. Full argument reference
 
 The authoritative flag list is in the code:
 
