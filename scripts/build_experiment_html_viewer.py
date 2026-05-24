@@ -122,7 +122,6 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
   <div class="page">
     <div class="panel" style="margin-bottom:16px;">
       <h1>DeepAR Experiment Viewer</h1>
-      <div class="muted">Experiment root: {root.as_posix()}</div>
       <div class="chips">
         <span class="chip">Runs: {len(manifest)}</span>
         <span class="chip">Modes: {", ".join(MODE_ORDER)}</span>
