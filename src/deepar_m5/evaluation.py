@@ -177,71 +177,12 @@ def compute_holdout_metrics(
     bundle,
     data_dir: Path,
     prediction_length: int,
+    compute_wrmsse: bool = False,
 ) -> dict:
-    """Compute 12-level WRMSSE and other holdout metrics for the M5 competition."""
+    """Compute holdout metrics for the M5 competition.
 
-    # 1. Aggregate unit sales to all 12 levels
-    pred_levels = _aggregate_to_levels(predictions.astype(np.float64), bundle.sales_frame)
-    actual_levels = _aggregate_to_levels(actuals.astype(np.float64), bundle.sales_frame)
-    train_levels = _aggregate_to_levels(train_values.astype(np.float64), bundle.sales_frame)
-
-    # 2. Compute Revenue for each bottom-level series (Level 12)
-    # Revenue is calculated over the last 28 days of training data
-    day_columns = bundle.day_columns[-prediction_length:]
-    sales = bundle.sales_frame[["item_id", "store_id", *day_columns]].copy()
-    long_sales = sales.melt(
-        id_vars=["item_id", "store_id"],
-        value_vars=day_columns,
-        var_name="d",
-        value_name="units",
-    )
-    calendar = pd.read_csv(data_dir / "calendar.csv", usecols=["d", "wm_yr_wk"])
-    prices = pd.read_csv(data_dir / "sell_prices.csv")
-    long_sales = long_sales.merge(calendar, on="d", how="left")
-    long_sales = long_sales.merge(prices, on=["store_id", "item_id", "wm_yr_wk"], how="left")
-    long_sales["sell_price"] = long_sales["sell_price"].fillna(0.0)
-    long_sales["revenue"] = long_sales["units"].astype(float) * long_sales["sell_price"].astype(float)
-    
-    # Bottom-level revenue
-    bottom_revenue = long_sales.groupby(["item_id", "store_id"], sort=True)["revenue"].sum()
-    # Ensure it aligns with Level 12 series order
-    # Level 12 was aggregated using groupby(["item_id", "store_id"], sort=True) in _aggregate_to_levels
-    # But wait, bundle.sales_frame is already Level 12. 
-    # Let's just calculate revenue for each row in bundle.sales_frame.
-    
-    row_revenue = []
-    # Faster way to get revenue per row
-    rev_per_item_store = bottom_revenue.to_dict()
-    for row in bundle.sales_frame.itertuples():
-        row_revenue.append(rev_per_item_store.get((row.item_id, row.store_id), 0.0))
-    row_revenue = np.array(row_revenue, dtype=np.float64)
-
-    # 3. Aggregate revenue to all levels and compute weights
-    # weights for each level must sum to 1. Total WRMSSE is mean of level-WRMSSEs.
-    revenue_levels = _aggregate_to_levels(row_revenue[:, None], bundle.sales_frame)
-    
-    level_rmsses = []
-    level_wrmsses = []
-    
-    for l_idx in range(12):
-        p = pred_levels[l_idx]
-        a = actual_levels[l_idx]
-        t = train_levels[l_idx]
-        r = revenue_levels[l_idx].flatten()
-        
-        # Weights for this level
-        w = r / np.sum(r).clip(min=1e-12)
-        
-        # RMSSE for each series in this level
-        mse = np.mean(np.square(p - a), axis=1)
-        denom = rmsse_denominators(t)
-        rmsse = np.sqrt(mse / denom)
-        
-        level_rmsses.append(float(np.mean(rmsse)))
-        level_wrmsses.append(float(np.sum(w * rmsse)))
-
-    # Final WRMSSE is the average across all 12 levels
-    wrmsse = float(np.mean(level_wrmsses))
+    WRMSSE is computed only when ``compute_wrmsse`` is ``True``.
+    """
 
     # Calculate basic bottom-level metrics (Level 12) per series
     pred_b = predictions.astype(np.float64)
@@ -272,9 +213,6 @@ def compute_holdout_metrics(
     series_rmsse = np.sqrt(np.mean(np.square(error_b), axis=1) / denom_b)
 
     metrics = {
-        "wrmsse": wrmsse,
-        "rmsse_l12": level_rmsses[11],
-        "wrmsse_l12": level_wrmsses[11],
         "mae": float(abs_error_b.mean()),
         "rmse": float(np.sqrt(np.mean(np.square(error_b)))),
         "wape": float(abs_error_b.sum() / max(float(np.abs(actual_b).sum()), 1e-12)),
@@ -282,9 +220,62 @@ def compute_holdout_metrics(
         "num_series": int(pred_b.shape[0]),
         "prediction_length": int(pred_b.shape[1]),
     }
-    # Add all level WRMSSEs for detailed analysis
-    for i, val in enumerate(level_wrmsses):
-        metrics[f"wrmsse_l{i+1}"] = val
+
+    if compute_wrmsse:
+        # 1. Aggregate unit sales to all 12 levels
+        pred_levels = _aggregate_to_levels(predictions.astype(np.float64), bundle.sales_frame)
+        actual_levels = _aggregate_to_levels(actuals.astype(np.float64), bundle.sales_frame)
+        train_levels = _aggregate_to_levels(train_values.astype(np.float64), bundle.sales_frame)
+
+        # 2. Compute Revenue for each bottom-level series (Level 12)
+        day_columns = bundle.day_columns[-prediction_length:]
+        sales = bundle.sales_frame[["item_id", "store_id", *day_columns]].copy()
+        long_sales = sales.melt(
+            id_vars=["item_id", "store_id"],
+            value_vars=day_columns,
+            var_name="d",
+            value_name="units",
+        )
+        calendar = pd.read_csv(data_dir / "calendar.csv", usecols=["d", "wm_yr_wk"])
+        prices = pd.read_csv(data_dir / "sell_prices.csv")
+        long_sales = long_sales.merge(calendar, on="d", how="left")
+        long_sales = long_sales.merge(prices, on=["store_id", "item_id", "wm_yr_wk"], how="left")
+        long_sales["sell_price"] = long_sales["sell_price"].fillna(0.0)
+        long_sales["revenue"] = long_sales["units"].astype(float) * long_sales["sell_price"].astype(float)
+
+        bottom_revenue = long_sales.groupby(["item_id", "store_id"], sort=True)["revenue"].sum()
+
+        row_revenue = []
+        rev_per_item_store = bottom_revenue.to_dict()
+        for row in bundle.sales_frame.itertuples():
+            row_revenue.append(rev_per_item_store.get((row.item_id, row.store_id), 0.0))
+        row_revenue = np.array(row_revenue, dtype=np.float64)
+
+        # 3. Aggregate revenue to all levels and compute weights
+        revenue_levels = _aggregate_to_levels(row_revenue[:, None], bundle.sales_frame)
+
+        level_rmsses = []
+        level_wrmsses = []
+
+        for l_idx in range(12):
+            p = pred_levels[l_idx]
+            a = actual_levels[l_idx]
+            t = train_levels[l_idx]
+            r = revenue_levels[l_idx].flatten()
+
+            w = r / np.sum(r).clip(min=1e-12)
+            mse = np.mean(np.square(p - a), axis=1)
+            denom = rmsse_denominators(t)
+            rmsse = np.sqrt(mse / denom)
+
+            level_rmsses.append(float(np.mean(rmsse)))
+            level_wrmsses.append(float(np.sum(w * rmsse)))
+
+        metrics["wrmsse"] = float(np.mean(level_wrmsses))
+        metrics["rmsse_l12"] = level_rmsses[11]
+        metrics["wrmsse_l12"] = level_wrmsses[11]
+        for i, val in enumerate(level_wrmsses):
+            metrics[f"wrmsse_l{i+1}"] = val
 
     # Per-series breakdown for saving to CSV
     series_metrics = pd.DataFrame({

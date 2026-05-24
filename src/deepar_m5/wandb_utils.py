@@ -8,17 +8,30 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_WANDB_PROJECT = "m5-competition"
+DEFAULT_WANDB_GROUP = "deepar_m5_experiments"
+DEFAULT_WANDB_MODE = "online"
+DEFAULT_WANDB_TAGS = "deepar,m5,experiments"
+
 
 def add_wandb_args(parser: argparse.ArgumentParser) -> None:
     """Add optional Weights & Biases tracking flags to a CLI parser."""
 
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
-    parser.add_argument("--wandb-project", default="m5-competition")
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging.",
+    )
+    parser.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
-    parser.add_argument("--wandb-group", default=None)
-    parser.add_argument("--wandb-mode", default="online", choices=["online", "offline", "disabled"])
-    parser.add_argument("--wandb-tags", default="", help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb-group", default=DEFAULT_WANDB_GROUP)
+    parser.add_argument(
+        "--wandb-mode",
+        default=DEFAULT_WANDB_MODE,
+        choices=["online", "offline", "disabled"],
+    )
+    parser.add_argument("--wandb-tags", default=DEFAULT_WANDB_TAGS, help="Comma-separated W&B tags.")
 
 
 def init_wandb(
@@ -31,17 +44,20 @@ def init_wandb(
 
     if not getattr(args, "wandb", False):
         return None
+
     try:
         import wandb
     except ImportError as exc:
         raise ImportError("wandb is not installed. Install it with `pip install wandb`.") from exc
 
     tags = [tag.strip() for tag in getattr(args, "wandb_tags", "").split(",") if tag.strip()]
+    resolved_group = group or getattr(args, "wandb_group", None)
+    logger.info("Starting W&B run: project=%s group=%s mode=%s", getattr(args, "wandb_project", "m5-competition"), resolved_group, getattr(args, "wandb_mode", "online"))
     return wandb.init(
         entity=getattr(args, "wandb_entity", None),
         project=getattr(args, "wandb_project", "m5-competition"),
         name=run_name or getattr(args, "wandb_run_name", None),
-        group=group or getattr(args, "wandb_group", None),
+        group=resolved_group,
         mode=getattr(args, "wandb_mode", "online"),
         tags=tags,
         config=config,

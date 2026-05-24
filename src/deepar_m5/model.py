@@ -123,7 +123,7 @@ class DeepAR(nn.Module):
         """Run one autoregressive step and produce negative-binomial parameters."""
 
         x = torch.cat([prev_scaled_target, covariates_t, static_emb, log_scale], dim=-1)
-        logger.info(f"x shape: {x.shape}")
+        # logger.info(f"x shape: {x.shape}")
         next_states = []
         for layer_idx, cell in enumerate(self.cells):
             h, c = cell(x, states[layer_idx])
@@ -131,7 +131,7 @@ class DeepAR(nn.Module):
             next_states.append((h, c))
 
         raw = self.output(x)
-        logger.info(f"raw shape: {raw.shape}")
+        # logger.info(f"raw shape: {raw.shape}")
         mu_scaled = F.softplus(raw[:, :1]) + 1e-4
         alpha = F.softplus(raw[:, 1:2]) + 1e-4
         return mu_scaled, alpha, next_states
@@ -147,15 +147,15 @@ class DeepAR(nn.Module):
         """Run teacher-forced training over a full context-plus-horizon window."""
 
         batch_size, seq_len = target.shape
-        logger.info(f"target_shape: {target.shape}")
-        logger.info(f"batch_size: {batch_size}, seq_len: {seq_len}")
-        logger.info(f"shape static_cats: {static_cats.shape}")
+        # logger.info(f"target_shape: {target.shape}")
+        # logger.info(f"batch_size: {batch_size}, seq_len: {seq_len}")
+        # logger.info(f"shape static_cats: {static_cats.shape}")
         static_emb = self.static_embedding(static_cats)
-        logger.info(f"shape static_embed: {static_emb.shape}")
-        logger.info(f"shape scale: {scale.shape}")
+        # logger.info(f"shape static_embed: {static_emb.shape}")
+        # logger.info(f"shape scale: {scale.shape}")
         log_scale = torch.log1p(scale)
         states = self.initial_state(batch_size, target.device)
-        logger.info(f"initial states shape: {len(states)}")
+        # logger.info(f"initial states shape: {len(states)}")
 
         if prior_target is not None:
             prev_scaled = prior_target.unsqueeze(1) / scale.clamp_min(1e-4)
@@ -166,7 +166,7 @@ class DeepAR(nn.Module):
         mus = []
         alphas = []
         for step in range(seq_len):
-            logger.info(f"processing: step: {step}/{seq_len}")
+            # logger.info(f"processing: step: {step}/{seq_len}")
             mu_scaled, alpha, states = self._step(
                 prev_scaled,
                 covariates[:, step, :],

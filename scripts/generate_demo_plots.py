@@ -100,9 +100,26 @@ def main():
     if metrics_path.exists():
         with open(metrics_path, "r") as f:
             all_metrics = json.load(f)
-        print("\n--- Global WRMSSE Comparison ---")
-        for mode, m_dict in all_metrics.items():
-            print(f"{mode:12}: {m_dict['wrmsse']:.5f}")
+        raw_wrmsse_values = {
+            mode: m_dict["raw"]["wrmsse"]
+            for mode, m_dict in all_metrics.items()
+            if "raw" in m_dict and "wrmsse" in m_dict["raw"]
+        }
+        rounded_wrmsse_values = {
+            mode: m_dict["rounded"]["wrmsse"]
+            for mode, m_dict in all_metrics.items()
+            if "rounded" in m_dict and "wrmsse" in m_dict["rounded"]
+        }
+        if raw_wrmsse_values:
+            print("\n--- Global WRMSSE Comparison ---")
+            for mode, value in raw_wrmsse_values.items():
+                rounded_value = rounded_wrmsse_values.get(mode)
+                if rounded_value is not None:
+                    print(f"{mode:12}: raw={value:.5f} rounded={rounded_value:.5f}")
+                else:
+                    print(f"{mode:12}: {value:.5f}")
+        else:
+            print("\nWRMSSE was not computed for this run.")
 
 if __name__ == "__main__":
     main()

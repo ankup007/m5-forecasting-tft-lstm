@@ -222,8 +222,6 @@ prev_scaled = mu_scaled
 
 That means it feeds the predicted mean back into the next future step instead of sampling a random value from the Negative Binomial distribution.
 
-That means it feeds the predicted mean back into the next future step instead of sampling a random value from the Negative Binomial distribution.
-
 Sampled decoding uses:
 
 ```python
@@ -250,20 +248,7 @@ $$
 
 then rolls forward many paths and computes summary statistics.
 
-Common usage:
-
-```bash
-# Deterministic mean-style point forecast.
-python scripts/predict_deepar_m5.py --forecast-mode mean
-
-# Monte Carlo mean from sampled paths.
-python scripts/predict_deepar_m5.py --forecast-mode sample-mean --num-samples 200 --sample-seed 42
-
-# P90 forecast from sampled paths.
-python scripts/predict_deepar_m5.py --forecast-mode quantile --quantile 0.9 --num-samples 500 --sample-seed 42
-```
-
-Typical practice:
+Operational command examples are kept in [DeepAR M5 Setup Guide](./SETUP_GUIDE.md). Typical usage patterns are:
 
 - Use `mean` when you want a fast point forecast.
 - Use `sample-mean` when you want the expected value implied by sampled trajectories.

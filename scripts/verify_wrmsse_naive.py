@@ -54,7 +54,8 @@ def main():
             train_values,
             bundle,
             Path(config.data_dir),
-            config.prediction_length
+            config.prediction_length,
+            compute_wrmsse=True,
         )
         
         print(f"\n--- {name} Forecast WRMSSE Verification ---")

@@ -42,63 +42,11 @@ The comparison should keep the validation horizon, feature set, context length, 
 
 The repository includes a PyTorch-only DeepAR implementation under `src/deepar_m5`. It does not use forecasting libraries or built-in recurrent layers; the LSTM cell, negative-binomial likelihood, sampled training windows, training loop, and autoregressive inference are implemented directly.
 
+For setup, training, prediction, and experiment commands, use [DeepAR M5 Setup Guide](./SETUP_GUIDE.md). That guide is the canonical runbook and is kept in sync with the code.
+
 For a code walkthrough, tuning guide, and extension notes, read [DeepAR Implementation Guide](./IMPLEMENTATION_README.md).
 
 For the training/prediction mechanics, including teacher forcing, autoregressive rollout, Negative Binomial likelihood, and mean versus sampled forecasts, read [Understanding DeepAR Training And Prediction](./DEEPAR_TRAINING_AND_PREDICTION_README.md).
-
-Create the isolated conda environment:
-
-```powershell
-conda env create -f environment.yml
-conda activate m5-deepar-scratch
-```
-
-Run a smoke test:
-
-```powershell
-python scripts\smoke_deepar_m5.py --subset-size 12 --context-length 28 --prediction-length 7 --device cpu
-```
-
-Train a pilot model:
-
-```powershell
-python scripts\train_deepar_m5.py --subset-size 1000 --context-length 56 --prediction-length 28 --batch-size 128 --epochs 10 --steps-per-epoch 200 --device auto
-```
-
-By default, training uses `sales_train_evaluation.csv`, which contains the same 30,490 item-store series as `sales_train_validation.csv` plus the extra actual sales days `d_1914` through `d_1941`. With a 28-day horizon, the script trains on windows ending before those final 28 known days and uses `d_1914` through `d_1941` as its internal validation holdout. To simulate the original validation-stage forecast, train with `--sales-file sales_train_validation.csv`; that uses only `d_1` through `d_1913` as known sales and forecasts `d_1914` through `d_1941` at inference time.
-
-Generate a submission-shaped file:
-
-```powershell
-python scripts\predict_deepar_m5.py --checkpoint artifacts\deepar_m5\best.pt --output artifacts\deepar_m5\submission.csv --device auto
-```
-
-Prediction defaults to deterministic mean decoding. For uncertainty-aware outputs, use sampled paths and summarize them, for example:
-
-```powershell
-python scripts\predict_deepar_m5.py --checkpoint artifacts\deepar_m5\best.pt --output artifacts\deepar_m5\submission_p90.csv --forecast-mode quantile --quantile 0.9 --num-samples 500 --sample-seed 42 --device auto
-```
-
-If the checkpoint was trained on a subset, prediction uses the saved
-`selected_series_ids` from that checkpoint. Those series receive DeepAR model
-forecasts; all other `sample_submission.csv` rows receive a recent-history
-fallback so the output file is complete. The fallback uses the same sales file
-recorded in the checkpoint, avoiding validation/evaluation leakage across the
-two M5 sales files.
-
-Run a hyperparameter sweep with evaluation-holdout metrics:
-
-```powershell
-python scripts\run_deepar_m5_experiments.py --subset-sizes 100 --context-lengths 28,56 --hidden-sizes 16,32 --embedding-dims 4,8 --epochs-list 2 --steps-per-epoch-list 20 --batch-sizes 16 --forecast-modes mean,quantile --quantiles 0.5,0.9 --num-samples 200 --output-dir artifacts\deepar_m5_experiments --device cpu
-```
-
-This trains on `sales_train_validation.csv`, forecasts `d_1914` through `d_1941`, compares against `sales_train_evaluation.csv`, and writes per-run checkpoints, forecasts, holdout metrics, and a `summary.csv`.
-
-Add W&B tracking to compare runs in the dashboard:
-
-```powershell
-python scripts\run_deepar_m5_experiments.py --subset-sizes 100 --context-lengths 28,56 --hidden-sizes 16,32 --embedding-dims 4,8 --epochs-list 2 --steps-per-epoch-list 20 --batch-sizes 16 --forecast-modes mean,quantile --quantiles 0.5,0.9 --num-samples 200 --output-dir artifacts\deepar_m5_experiments --device cpu --wandb --wandb-project m5-competition --wandb-entity ankup25694 --wandb-group deepar-sweep-v1
-```
 
 ## References
 

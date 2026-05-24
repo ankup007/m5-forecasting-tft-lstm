@@ -150,6 +150,7 @@ def run_holdout_evaluation(
     args: argparse.Namespace,
     device: torch.device,
     wandb_run=None,
+    compute_wrmsse: bool = False,
 ) -> None:
     """Run the 12-level competitive evaluation for multiple forecast summaries."""
 
@@ -174,33 +175,79 @@ def run_holdout_evaluation(
 
     for mode, predictions in forecasts_dict.items():
         logger.info("Computing metrics for mode: %s", mode)
-        holdout_metrics, series_metrics = compute_holdout_metrics(
+        holdout_metrics_raw, series_metrics_raw = compute_holdout_metrics(
             predictions,
             actuals,
             bundle.sales_values,
             bundle,
             Path(args.data_dir),
             args.prediction_length,
+            compute_wrmsse=compute_wrmsse,
+        )
+
+        rounded_predictions = np.rint(predictions).clip(min=0.0).astype(np.float32)
+        holdout_metrics_rounded, series_metrics_rounded = compute_holdout_metrics(
+            rounded_predictions,
+            actuals,
+            bundle.sales_values,
+            bundle,
+            Path(args.data_dir),
+            args.prediction_length,
+            compute_wrmsse=compute_wrmsse,
         )
         
         # Save per-mode artifacts
-        forecasts_path = artifact_dir / f"holdout_forecasts_{mode}.csv"
-        write_forecast_csv(forecasts_path, selected_ids, predictions, actuals, series_metrics)
+        forecasts_path_raw = artifact_dir / f"holdout_forecasts_{mode}.csv"
+        forecasts_path_rounded = artifact_dir / f"holdout_forecasts_{mode}_rounded.csv"
+        write_forecast_csv(forecasts_path_raw, selected_ids, predictions, actuals, series_metrics_raw)
+        write_forecast_csv(
+            forecasts_path_rounded,
+            selected_ids,
+            rounded_predictions,
+            actuals,
+            series_metrics_rounded,
+        )
         
         # Add to global summary
-        all_summary_metrics[mode] = holdout_metrics
+        all_summary_metrics[mode] = {
+            "raw": holdout_metrics_raw,
+            "rounded": holdout_metrics_rounded,
+        }
         
         # Log to W&B with mode prefix
-        wandb_log(wandb_run, {f"holdout/{mode}/{k}": v for k, v in holdout_metrics.items() if v is not None})
-        wandb_save(wandb_run, forecasts_path)
+        wandb_log(
+            wandb_run,
+            {
+                **{f"holdout/{mode}/raw/{k}": v for k, v in holdout_metrics_raw.items() if v is not None},
+                **{f"holdout/{mode}/rounded/{k}": v for k, v in holdout_metrics_rounded.items() if v is not None},
+            },
+        )
+        wandb_save(wandb_run, forecasts_path_raw)
+        wandb_save(wandb_run, forecasts_path_rounded)
 
     # Save aggregate metrics JSON
     metrics_path = artifact_dir / "holdout_metrics_all_modes.json"
-    metrics_path.write_text(json.dumps(all_summary_metrics, indent=2), encoding="utf-8")
+    metrics_text = json.dumps(all_summary_metrics, indent=2)
+    metrics_path.write_text(metrics_text, encoding="utf-8")
+    # Keep the legacy filename in sync for older experiment scripts.
+    legacy_metrics_path = artifact_dir / "holdout_metrics.json"
+    legacy_metrics_path.write_text(metrics_text, encoding="utf-8")
     wandb_save(wandb_run, metrics_path)
+    wandb_save(wandb_run, legacy_metrics_path)
 
-    # Log primary WRMSSE for easy comparison (using 'mean' as primary)
-    logger.info("Multi-mode holdout complete. Summary (mean WRMSSE): %.5f", all_summary_metrics["mean"]["wrmsse"])
+    if compute_wrmsse and "wrmsse" in all_summary_metrics.get("mean", {}).get("raw", {}):
+        raw_wrmsse = all_summary_metrics["mean"]["raw"]["wrmsse"]
+        rounded_wrmsse = all_summary_metrics["mean"]["rounded"].get("wrmsse")
+        if rounded_wrmsse is not None:
+            logger.info(
+                "Multi-mode holdout complete. Summary (mean WRMSSE raw/rounded): %.5f / %.5f",
+                raw_wrmsse,
+                rounded_wrmsse,
+            )
+        else:
+            logger.info("Multi-mode holdout complete. Summary (mean WRMSSE): %.5f", raw_wrmsse)
+    else:
+        logger.info("Multi-mode holdout complete. WRMSSE was not computed.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -227,9 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", default="INFO")
     # Holdout evaluation arguments
     parser.add_argument("--eval-holdout", action="store_true", help="Run full competition metric evaluation at end.")
-    parser.add_argument("--forecast-mode", default="mean", choices=["mean", "sample-mean", "quantile"])
+    parser.add_argument("--eval-wrmsse", action="store_true", help="Also compute and save WRMSSE holdout metrics.")
     parser.add_argument("--num-samples", type=int, default=100)
-    parser.add_argument("--quantile", type=float, default=0.5)
     parser.add_argument("--sample-seed", type=int, default=42)
     add_wandb_args(parser)
     return parser
@@ -330,7 +376,16 @@ def run_training(args: argparse.Namespace, wandb_run=None) -> tuple[DeepAR, list
     if args.eval_holdout:
         if best_state is not None:
             model.load_state_dict(best_state)
-        run_holdout_evaluation(model, bundle, data_config, artifact_dir, args, device, wandb_run)
+        run_holdout_evaluation(
+            model,
+            bundle,
+            data_config,
+            artifact_dir,
+            args,
+            device,
+            wandb_run,
+            compute_wrmsse=args.eval_wrmsse,
+        )
     
     return model, metrics_history
 

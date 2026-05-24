@@ -95,6 +95,7 @@ def main(argv: list[str] | None = None) -> None:
         bundle,
         Path(args.data_dir),
         data_config.prediction_length,
+        compute_wrmsse=True,
     )
 
     # Save results

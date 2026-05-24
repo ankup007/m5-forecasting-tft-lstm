@@ -16,7 +16,11 @@ def configure_logging(log_level: str) -> None:
     level = getattr(logging, log_level.upper(), None)
     if not isinstance(level, int):
         raise ValueError(f"Unknown log level: {log_level}")
-    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s")
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s:%(name)s:%(filename)s:%(lineno)d:%(message)s",
+        force=True,
+    )
 
 
 def batch_to_torch(batch: dict[str, np.ndarray], device: torch.device) -> dict[str, torch.Tensor]:

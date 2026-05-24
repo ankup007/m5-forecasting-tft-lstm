@@ -2,8 +2,10 @@ import argparse
 import itertools
 import json
 import logging
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import datetime
 
 import pandas as pd
 
@@ -17,8 +19,9 @@ logger = logging.getLogger(__name__)
 def run_name(index: int, params: dict[str, int | float | str]) -> str:
     """Build a compact directory name for one experiment configuration."""
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     pieces = [
-        f"run_{index:03d}",
+        f"run_{timestamp}_{index:03d}",
         f"subset{params['subset_size']}",
         f"ctx{params['context_length']}",
         f"h{params['hidden_size']}",
@@ -34,16 +37,16 @@ def run_name(index: int, params: dict[str, int | float | str]) -> str:
 
 # Define your hyperparameter grid here for sweeps
 GRID_CONFIG = {
-    "subset_size": [100],
-    "context_length": [56],
-    "batch_size": [32],
-    "epochs": [5],
-    "steps_per_epoch": [10],
-    "hidden_size": [16, 32],
+    "subset_size": [34590],
+    "context_length": [56, 84],
+    "batch_size": [128],
+    "epochs": [10],
+    "steps_per_epoch": [20],
+    "hidden_size": [16],
     "embedding_dim": [8],
-    "num_layers": [1],
+    "num_layers": [1,2],
     "dropout": [0.0],
-    "learning_rate": [0.01],
+    "learning_rate": [0.001],
     "seed": [42],
     "forecast_mode": ["mean"],
     "quantile": [0.5],
@@ -63,6 +66,17 @@ def experiment_grid() -> list[dict[str, int | float | str]]:
     return grid
 
 
+def flatten_holdout_metrics(all_modes_metrics: dict[str, dict[str, dict[str, float | int]]]) -> dict[str, float | int]:
+    """Flatten nested raw/rounded holdout metrics into CSV-friendly columns."""
+
+    flat: dict[str, float | int] = {}
+    for mode, variants in all_modes_metrics.items():
+        for variant_name, metrics in variants.items():
+            for metric_name, value in metrics.items():
+                flat[f"{mode}_{variant_name}_{metric_name}"] = value
+    return flat
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Define basic CLI arguments for experiment sweeps."""
 
@@ -76,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--eval-wrmsse", action="store_true", help="Also compute and save WRMSSE holdout metrics.")
     add_wandb_args(parser)
     return parser
 
@@ -85,6 +100,13 @@ def main(argv: list[str] | None = None) -> None:
 
     args = build_parser().parse_args(argv)
     configure_logging(args.log_level)
+    sweep_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    wandb_group = args.wandb_group
+    if "--wandb-group" not in raw_argv:
+        wandb_group = f"exp_run_{sweep_timestamp}"
+    elif wandb_group in (None, ""):
+        wandb_group = f"exp_run_{sweep_timestamp}"
     
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +133,7 @@ def main(argv: list[str] | None = None) -> None:
             args,
             config=vars(train_args),
             run_name=args.wandb_run_name or artifact_dir.name,
-            group=args.wandb_group or output_dir.name,
+            group=wandb_group,
         )
         
         try:
@@ -119,24 +141,27 @@ def main(argv: list[str] | None = None) -> None:
             model, train_metrics = run_training(train_args, wandb_run)
             
             # Read the metrics file saved by run_training to get final scores
-            metrics_path = artifact_dir / "holdout_metrics.json"
+            metrics_path = artifact_dir / "holdout_metrics_all_modes.json"
+            if not metrics_path.exists():
+                metrics_path = artifact_dir / "holdout_metrics.json"
             holdout_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            flat_holdout_metrics = flatten_holdout_metrics(holdout_metrics)
 
             row = {
                 "run": artifact_dir.name,
                 **params,
-                **holdout_metrics,
+                **flat_holdout_metrics,
                 "best_internal_val_nll": min(metric["val_loss"] for metric in train_metrics),
             }
             summary_rows.append(row)
-            summary_path = output_dir / "summary.csv"
+            summary_path = output_dir / f"summary_{sweep_timestamp}.csv"
             pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
             wandb_save(wandb_run, summary_path)
             logger.info("%s holdout metrics: %s", artifact_dir.name, holdout_metrics)
         finally:
             wandb_finish(wandb_run)
 
-    logger.info("Wrote experiment summary to %s", output_dir / "summary.csv")
+    logger.info("Wrote experiment summary to %s", output_dir / f"summary_{sweep_timestamp}.csv")
 
 
 if __name__ == "__main__":
