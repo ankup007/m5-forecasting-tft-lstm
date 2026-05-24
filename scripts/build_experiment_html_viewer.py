@@ -79,7 +79,7 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DeepAR Experiment Viewer</title>
+  <title>M5 Forecasts - DeepAR Experiment Viewer</title>
   <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
   <style>
     :root {{
@@ -121,7 +121,7 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
 <body>
   <div class="page">
     <div class="panel" style="margin-bottom:16px;">
-      <h1>DeepAR Experiment Viewer</h1>
+      <h1>M5 Forecasts - DeepAR Experiment Viewer</h1>
       <div class="chips">
         <span class="chip">Runs: {len(manifest)}</span>
         <span class="chip">Modes: {", ".join(MODE_ORDER)}</span>
