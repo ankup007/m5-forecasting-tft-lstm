@@ -10,6 +10,8 @@ conda env create -f environment.yml
 conda activate m5-deepar-scratch
 ```
 
+If you already created the environment earlier, use `conda env update -f environment.yml` instead of recreating it from scratch.
+
 ## 2. Smoke test
 
 ```powershell
@@ -58,12 +60,22 @@ Per run, the following are written:
 - `holdout_forecasts_sample-mean_rounded.csv`
 - `holdout_forecasts_p25.csv`
 - `holdout_forecasts_p25_rounded.csv`
+- `holdout_forecasts_p50.csv`
+- `holdout_forecasts_p50_rounded.csv`
 - `holdout_forecasts_p75.csv`
 - `holdout_forecasts_p75_rounded.csv`
 - `holdout_metrics_all_modes.json` when `--eval-wrmsse` is set
 - `holdout_metrics.json` as a compatibility copy when `--eval-wrmsse` is set
 
-## 5. Evaluation mode
+## 5. Experiment dashboard
+
+```powershell
+streamlit run scripts\experiment_dashboard.py
+```
+
+Use the sidebar to pick a summary file, a run, a series, and a forecast variant. The dashboard shows run-level aggregate metrics and per-series holdout plots for the available forecast modes.
+
+## 6. Evaluation mode
 
 ```powershell
 python scripts\evaluate_deepar_m5.py --checkpoint artifacts\my_run\best.pt --sales-file sales_train_evaluation.csv --output-dir evaluations\test_run
@@ -71,7 +83,7 @@ python scripts\evaluate_deepar_m5.py --checkpoint artifacts\my_run\best.pt --sal
 
 This writes evaluation metrics and forecast CSV files for the checkpoint.
 
-## 6. Prediction mode
+## 7. Prediction mode
 
 ```powershell
 python scripts\predict_deepar_m5.py --checkpoint artifacts\my_run\best.pt --output predictions\submission_v1.csv
@@ -83,17 +95,17 @@ For quantile or sample-based forecasts:
 python scripts\predict_deepar_m5.py --checkpoint artifacts\my_run\best.pt --output predictions\submission_p90.csv --forecast-mode quantile --quantile 0.9 --num-samples 500 --sample-seed 42
 ```
 
-## 7. Weights & Biases
+## 8. Weights & Biases
 
 Enable W&B with the CLI flag:
 
 ```powershell
-python scripts\run_deepar_m5_experiments.py --wandb --output-dir artifacts\deepar_m5_experiments --device cpu
+python scripts\run_deepar_m5_experiments.py --wandb
 ```
 
 The script itself preconfigures the W&B project, group, tags, and mode defaults.
 
-## 8. Full argument reference
+## 9. Full argument reference
 
 The authoritative flag list is in the code:
 

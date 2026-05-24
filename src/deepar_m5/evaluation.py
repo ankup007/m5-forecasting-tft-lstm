@@ -26,7 +26,7 @@ def forecast_multi_summaries(
     num_samples: int,
     sample_seed: int | None,
 ) -> dict[str, np.ndarray]:
-    """Efficiently generate multiple forecast types (mean, sample-mean, p25, p75) in one go."""
+    """Efficiently generate multiple forecast types (mean, sample-mean, p25, p50, p75) in one go."""
 
     if sample_seed is not None:
         torch.manual_seed(sample_seed)
@@ -38,6 +38,7 @@ def forecast_multi_summaries(
         "mean": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
         "sample-mean": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
         "p25": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
+        "p50": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
         "p75": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
     }
     
@@ -80,6 +81,7 @@ def forecast_multi_summaries(
             # 3. Derive stochastic summaries from the same samples
             results["sample-mean"][series_idx] = samples.mean(dim=0).cpu().numpy()
             results["p25"][series_idx] = torch.quantile(samples, 0.25, dim=0).cpu().numpy()
+            results["p50"][series_idx] = torch.quantile(samples, 0.50, dim=0).cpu().numpy()
             results["p75"][series_idx] = torch.quantile(samples, 0.75, dim=0).cpu().numpy()
             
     return results
@@ -217,6 +219,8 @@ def compute_holdout_metrics(
         "rmse": float(np.sqrt(np.mean(np.square(error_b)))),
         "wape": float(abs_error_b.sum() / max(float(np.abs(actual_b).sum()), 1e-12)),
         "smape": float(np.mean(smape_values_b)),
+        "mape": float(np.nanmean(series_mape)) if np.any(~np.isnan(series_mape)) else float("nan"),
+        "rmsse": float(np.mean(series_rmsse)),
         "num_series": int(pred_b.shape[0]),
         "prediction_length": int(pred_b.shape[1]),
     }

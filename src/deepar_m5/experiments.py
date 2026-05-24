@@ -28,28 +28,28 @@ def run_name(index: int, params: dict[str, int | float | str]) -> str:
         f"emb{params['embedding_dim']}",
         f"ep{params['epochs']}",
         f"steps{params['steps_per_epoch']}",
-        str(params["forecast_mode"]).replace("-", ""),
     ]
-    if params["forecast_mode"] == "quantile":
-        pieces.append(f"q{int(float(params['quantile']) * 100):02d}")
+    forecast_mode = params.get("forecast_mode")
+    if forecast_mode is not None:
+        pieces.append(str(forecast_mode).replace("-", ""))
+        if forecast_mode == "quantile" and "quantile" in params:
+            pieces.append(f"q{int(float(params['quantile']) * 100):02d}")
     return "_".join(pieces)
 
 
 # Define your hyperparameter grid here for sweeps
 GRID_CONFIG = {
-    "subset_size": [34590],
-    "context_length": [56, 84],
-    "batch_size": [128],
-    "epochs": [10],
-    "steps_per_epoch": [20],
+    "subset_size": [100],
+    "context_length": [5],
+    "batch_size": [5],
+    "epochs": [1],
+    "steps_per_epoch": [5],
     "hidden_size": [16],
     "embedding_dim": [8],
-    "num_layers": [1,2],
+    "num_layers": [1],
     "dropout": [0.0],
     "learning_rate": [0.001],
     "seed": [42],
-    "forecast_mode": ["mean"],
-    "quantile": [0.5],
 }
 
 def experiment_grid() -> list[dict[str, int | float | str]]:

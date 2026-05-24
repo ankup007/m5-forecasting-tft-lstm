@@ -31,7 +31,7 @@ def main():
         artifact_dir = sorted(run_dirs)[-1]
         print(f"No run-dir specified. Using latest run: {artifact_dir}")
 
-    modes = ["mean", "sample-mean", "p25", "p75"]
+    modes = ["mean", "sample-mean", "p25", "p50", "p75"]
     
     # Load all forecast data
     dfs = {}
@@ -78,6 +78,9 @@ def main():
             p25 = dfs["p25"].iloc[i][f_cols].values
             p75 = dfs["p75"].iloc[i][f_cols].values
             plt.fill_between(days, p25, p75, color="gray", alpha=0.2, label="P25-P75 Uncertainty")
+
+        if "p50" in dfs:
+            plt.plot(days, dfs["p50"].iloc[i][f_cols].values, label="P50 / Median", color="purple", linestyle=':', alpha=0.8)
         
         # Title and Labels
         # Get metrics from the mean run for display
