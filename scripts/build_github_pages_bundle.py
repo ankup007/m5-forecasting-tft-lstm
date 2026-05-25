@@ -34,10 +34,39 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     bundle_run_dir = output_dir / run_dir.name
-    if bundle_run_dir.exists():
-        shutil.rmtree(bundle_run_dir)
-    bundle_run_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(series_json_dir, bundle_run_dir / "series_json")
+    bundle_run_dir.mkdir(parents=True, exist_ok=True)
+    bundle_series_json_dir = bundle_run_dir / "series_json"
+    if not bundle_series_json_dir.exists():
+        shutil.copytree(series_json_dir, bundle_series_json_dir)
+    else:
+        for filename in ["run_summary.json", "series_index.json"]:
+            source = series_json_dir / filename
+            target = bundle_series_json_dir / filename
+            if source.exists():
+                shutil.copy2(source, target)
+        source_series_dir = series_json_dir / "series"
+        target_series_dir = bundle_series_json_dir / "series"
+        if source_series_dir.exists():
+            target_series_dir.mkdir(parents=True, exist_ok=True)
+            for source_file in source_series_dir.glob("*.json"):
+                shutil.copy2(source_file, target_series_dir / source_file.name)
+    global_naive_dir = run_dir.parent / "naive_forecasts"
+    if global_naive_dir.exists():
+        bundle_naive_dir = output_dir / "naive_forecasts"
+        if not bundle_naive_dir.exists():
+            shutil.copytree(global_naive_dir, bundle_naive_dir)
+        else:
+            for filename in ["run_summary.json", "series_index.json"]:
+                source = global_naive_dir / filename
+                target = bundle_naive_dir / filename
+                if source.exists():
+                    shutil.copy2(source, target)
+            source_series_dir = global_naive_dir / "series"
+            target_series_dir = bundle_naive_dir / "series"
+            if source_series_dir.exists():
+                target_series_dir.mkdir(parents=True, exist_ok=True)
+                for source_file in source_series_dir.glob("*.json"):
+                    shutil.copy2(source_file, target_series_dir / source_file.name)
 
     (output_dir / ".nojekyll").write_text("", encoding="utf-8")
 

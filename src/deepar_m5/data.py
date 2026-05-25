@@ -307,6 +307,7 @@ def load_m5_bundle(
     config: DataConfig,
     encoders: dict[str, dict[str, int]] | None = None,
     series_ids: list[str] | None = None,
+    load_covariates: bool = True,
 ) -> M5Bundle:
     """Load M5 CSVs and return model-ready arrays plus metadata.
 
@@ -353,7 +354,13 @@ def load_m5_bundle(
     train_end = max(1, sales_values.shape[1] - config.prediction_length)
     scales = _series_scales(sales_values, train_end=train_end)
     static_cats = encode_static(sales, encoders)
-    covariates, covariate_columns = _build_covariate_cube(sales, calendar, prices)
+    
+    if load_covariates:
+        covariates, covariate_columns = _build_covariate_cube(sales, calendar, prices)
+    else:
+        covariates = np.zeros((0, 0, 0), dtype=np.float32)
+        covariate_columns = []
+
     logger.info(
         "Prepared M5 arrays: sales_values=%s, static_cats=%s, scales=%s, covariates=%s",
         sales_values.shape,

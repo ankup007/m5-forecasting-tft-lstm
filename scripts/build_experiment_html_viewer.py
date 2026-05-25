@@ -44,36 +44,58 @@ def build_manifest(root: Path) -> list[dict[str, Any]]:
         index_path = run_dir / "series_json" / "series_index.json"
         if not summary_path.exists() or not index_path.exists():
             continue
-        summary = load_json(summary_path)
-        index = load_json(index_path)
-        manifest.append(
-            {
-                "run": run_dir.name,
-                "run_dir": run_dir.name,
-                "series_count": index.get("series_count", 0),
-                "available_modes": summary.get("available_modes", MODE_ORDER),
-                "variants": summary.get("variants", VARIANTS),
-                "aggregate_metrics": summary.get("aggregate_metrics", {}),
-                "series_ids": index.get("series_ids", []),
-                "summary": summary,
-            }
-        )
+        try:
+            summary = load_json(summary_path)
+            index = load_json(index_path)
+            manifest.append(
+                {
+                    "run": run_dir.name,
+                    "run_dir": run_dir.name,
+                    "series_count": index.get("series_count", 0),
+                    "available_modes": summary.get("available_modes", MODE_ORDER),
+                    "variants": summary.get("variants", VARIANTS),
+                    "aggregate_metrics": summary.get("aggregate_metrics", {}),
+                    "series_ids": index.get("series_ids", []),
+                    "summary": summary,
+                }
+            )
+        except Exception as e:
+            print(f"Warning: Failed to load manifest for {run_dir.name}: {e}")
+            continue
     return manifest
 
 
+def load_global_baseline(root: Path) -> dict[str, Any]:
+    baseline_path = root / "naive_forecasts" / "run_summary.json"
+    index_path = root / "naive_forecasts" / "series_index.json"
+    data = load_json(baseline_path) if baseline_path.exists() else {}
+    if index_path.exists():
+        data["series_ids"] = load_json(index_path).get("series_ids", [])
+    return data
+
+
 def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
+    baseline_summary = load_global_baseline(root)
+    all_series_ids = baseline_summary.get("series_ids", [])
+    if not all_series_ids and manifest:
+        all_series_ids = manifest[0]["series_ids"]
+
     embedded = json.dumps(
         {
             "root": root.as_posix(),
             "runs": manifest,
+            "baseline_summary": baseline_summary,
+            "baseline_root": "naive_forecasts",
+            "all_series_ids": all_series_ids,
         },
         indent=2,
     )
-    run_options = "".join(
+    run_options = '<option value="">-- No Run Selected --</option>' + "".join(
         f'<option value="{item["run"]}">{item["run"]}</option>' for item in manifest
     )
-    first_run = manifest[0]["run"] if manifest else ""
-    first_series = manifest[0]["series_ids"][0] if manifest and manifest[0]["series_ids"] else ""
+    first_series = all_series_ids[0] if all_series_ids else ""
+    
+    # Use {{ and }} for literal braces in f-string
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -111,7 +133,7 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
     .metric {{ background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }}
     .metric .label {{ color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }}
     .metric .value {{ font-size: 20px; font-weight: 600; margin-top: 2px; }}
-    .chart {{ height: 360px; border: 1px solid var(--line); border-radius: 10px; background: #fff; overflow: hidden; }}
+    .chart {{ height: 420px; border: 1px solid var(--line); border-radius: 10px; background: #fff; overflow: hidden; }}
     .toolbar {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }}
     .toolbar button.active {{ border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }}
     .muted {{ color: var(--muted); }}
@@ -122,6 +144,7 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
   <div class="page">
     <div class="panel" style="margin-bottom:16px;">
       <h1>M5 Forecasts - DeepAR Experiment Viewer</h1>
+      <div class="muted">Forecasts are generated over the M5 evaluation window d1914-d1941.</div>
       <div class="chips">
         <span class="chip">Runs: {len(manifest)}</span>
         <span class="chip">Modes: {", ".join(MODE_ORDER)}</span>
@@ -129,10 +152,19 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
       </div>
     </div>
 
+    <div class="panel" style="margin-bottom:16px; border-left: 4px solid var(--accent);">
+      <h2>Global Baseline Reference</h2>
+      <div class="muted" id="baseline-note" style="margin-bottom:12px;">Reference forecasts (Naive and Seasonal Naive) are computed once for the dataset.</div>
+      <table class="table">
+        <thead><tr><th>Baseline</th><th>MAE</th><th>MAPE</th><th>RMSE</th><th>SMAPE</th><th>RMSSE</th><th>WRMSSE</th><th>Package WRMSSE</th></tr></thead>
+        <tbody id="baseline-body"></tbody>
+      </table>
+    </div>
+
     <div class="grid">
       <div class="panel">
         <div class="field">
-          <label for="run-select">Run</label>
+          <label for="run-select">Selected DeepAR Run</label>
           <select id="run-select">{run_options}</select>
         </div>
         <div class="field">
@@ -153,14 +185,15 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
         <div class="field">
           <button id="reload">Reload selected series</button>
         </div>
-        <div class="muted" id="run-label">{first_run}</div>
-        <div class="muted" id="series-label">{first_series}</div>
+        <div class="muted" id="run-label" style="font-size:11px; margin-top:10px;">None</div>
+        <div class="muted" id="series-label" style="font-size:11px;">{first_series}</div>
       </div>
 
       <div class="panel">
-        <h2>Aggregate Scores Across All Series</h2>
+        <h2>DeepAR Run Aggregate Scores</h2>
+        <div class="muted" style="margin-bottom:12px;">Metrics averaged across all 30,490 series.</div>
         <table class="table">
-          <thead><tr><th>Mode</th><th>Variant</th><th>MAE</th><th>MAPE</th><th>RMSE</th><th>SMAPE</th><th>RMSSE</th></tr></thead>
+          <thead><tr><th>Mode</th><th>Variant</th><th>MAE</th><th>MAPE</th><th>RMSE</th><th>SMAPE</th><th>RMSSE</th><th>WRMSSE</th></tr></thead>
           <tbody id="aggregate-body"></tbody>
         </table>
       </div>
@@ -176,30 +209,51 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
         <button data-mode="p75" class="mode">p75</button>
       </div>
       <div id="metrics" class="metrics"></div>
-      <div id="chart" class="chart"></div>
+      <div style="margin-top:12px;">
+        <h3 style="margin: 0 0 8px 0;">Series Metrics: <span id="current-series-id" style="color:var(--accent);">{first_series}</span></h3>
+        <table class="table">
+          <thead><tr><th>Source</th><th>MAE</th><th>MAPE</th><th>RMSE</th><th>SMAPE</th><th>RMSSE</th></tr></thead>
+          <tbody id="series-metrics-body"></tbody>
+        </table>
+      </div>
+      <div id="chart" class="chart" style="margin-top:16px;"></div>
     </div>
   </div>
 
   <script>
     const DATA = {embedded};
     const RUNS = DATA.runs || [];
+    const GLOBAL_BASELINE = DATA.baseline_summary || {{}};
+    const BASELINE_ROOT = DATA.baseline_root || "naive_forecasts";
+    const ALL_SERIES_IDS = DATA.all_series_ids || [];
+    
     const runSelect = document.getElementById("run-select");
     const queryEl = document.getElementById("query");
     const matchesEl = document.getElementById("matches");
     const variantEl = document.getElementById("variant");
     const metricsEl = document.getElementById("metrics");
+    const seriesMetricsBodyEl = document.getElementById("series-metrics-body");
     const seriesLabelEl = document.getElementById("series-label");
+    const currentSeriesIdEl = document.getElementById("current-series-id");
     const runLabelEl = document.getElementById("run-label");
     const aggregateBodyEl = document.getElementById("aggregate-body");
+    const baselineBodyEl = document.getElementById("baseline-body");
+    const baselineNoteEl = document.getElementById("baseline-note");
 
     let selectedRun = runSelect.value;
     let selectedSeries = {json.dumps(first_series)};
     let selectedMode = "mean";
     let currentPayload = null;
+    let currentBaselinePayload = null;
+    let currentWrmsse = null;
+
+    function fmt(val) {{
+      if (val === null || val === undefined || val === "" || Number.isNaN(Number(val))) return "n/a";
+      return Number(val).toFixed(2);
+    }}
 
     function metricCard(label, value) {{
-      const safe = value === null || value === undefined || Number.isNaN(value) ? "n/a" : Number(value).toFixed(4);
-      return `<div class="metric"><div class="label">${{label}}</div><div class="value">${{safe}}</div></div>`;
+      return `<div class="metric"><div class="label">${{label}}</div><div class="value">${{fmt(value)}}</div></div>`;
     }}
 
     function currentRunData() {{
@@ -208,30 +262,75 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
 
     function renderAggregate() {{
       const runData = currentRunData();
+      if (!runData) {{
+        aggregateBodyEl.innerHTML = "<tr><td colspan='8'>Select a run to see aggregate metrics</td></tr>";
+        return;
+      }}
       const rows = [];
       const aggregate = runData?.aggregate_metrics || {{}};
+      const wrmsseData = currentWrmsse || {{}};
+
       for (const mode of {json.dumps(MODE_ORDER)}) {{
         for (const variant of ["raw", "rounded"]) {{
           const metrics = aggregate?.[mode]?.[variant];
           if (!metrics) continue;
+          
+          const wrmsseVal = wrmsseData[mode]?.[variant]?.wrmsse;
+          
           rows.push(`
             <tr>
               <td>${{mode}}</td><td>${{variant}}</td>
-              <td>${{metrics.mae ?? "n/a"}}</td>
-              <td>${{metrics.mape ?? "n/a"}}</td>
-              <td>${{metrics.rmse ?? "n/a"}}</td>
-              <td>${{metrics.smape ?? "n/a"}}</td>
-              <td>${{metrics.rmsse ?? "n/a"}}</td>
+              <td>${{fmt(metrics.mae)}}</td>
+              <td>${{fmt(metrics.mape)}}</td>
+              <td>${{fmt(metrics.rmse)}}</td>
+              <td>${{fmt(metrics.smape)}}</td>
+              <td>${{fmt(metrics.rmsse)}}</td>
+              <td style="font-weight:bold; color:var(--accent);">${{fmt(wrmsseVal)}}</td>
             </tr>
           `);
         }}
       }}
-      aggregateBodyEl.innerHTML = rows.join("") || "<tr><td colspan='7'>No aggregate metrics found</td></tr>";
+      aggregateBodyEl.innerHTML = rows.join("") || "<tr><td colspan='8'>No aggregate metrics found</td></tr>";
+    }}
+
+    function renderBaselines() {{
+      const baselines = GLOBAL_BASELINE.baselines || {{
+        naive: GLOBAL_BASELINE.naive,
+        seasonal_naive: GLOBAL_BASELINE.seasonal_naive,
+      }};
+      const packageCompare = GLOBAL_BASELINE.package_compare || {{}};
+      if (!Object.keys(baselines || {{}}).length) {{
+        baselineBodyEl.innerHTML = "<tr><td colspan='8'>No baseline summary found</td></tr>";
+        baselineNoteEl.textContent = "Baseline artifacts are not available.";
+        return;
+      }}
+      const rows = [];
+      for (const key of ["naive", "seasonal_naive"]) {{
+        const metrics = baselines?.[key];
+        if (!metrics) continue;
+        const packageValue = packageCompare?.[`${{key}}_wrmsse`];
+        rows.push(`
+          <tr>
+            <td>${{key.replace("_", " ")}}</td>
+            <td>${{fmt(metrics.mae)}}</td>
+            <td>${{fmt(metrics.mape)}}</td>
+            <td>${{fmt(metrics.rmse)}}</td>
+            <td>${{fmt(metrics.smape)}}</td>
+            <td>${{fmt(metrics.rmsse)}}</td>
+            <td>${{fmt(metrics.wrmsse)}}</td>
+            <td>${{fmt(packageValue)}}</td>
+          </tr>
+        `);
+      }}
+      baselineBodyEl.innerHTML = rows.join("") || "<tr><td colspan='8'>No baseline summary found</td></tr>";
+      if (packageCompare?.note) baselineNoteEl.textContent = packageCompare.note;
+      else if (packageCompare?.error) baselineNoteEl.textContent = `Package comparison unavailable: ${{packageCompare.error}}`;
+      else baselineNoteEl.textContent = "Global reference forecasts (Naive and Seasonal Naive) are computed once for the dataset.";
     }}
 
     function makeMatches(query) {{
       const runData = currentRunData();
-      const ids = runData?.series_ids || [];
+      const ids = runData?.series_ids || ALL_SERIES_IDS || [];
       const cleaned = (query || "").trim().toLowerCase();
       const matches = cleaned ? ids.filter((id) => id.toLowerCase().includes(cleaned)) : ids.slice(0, {SEARCH_LIMIT});
       return matches.slice(0, {SEARCH_LIMIT});
@@ -246,6 +345,7 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
         el.addEventListener("click", () => {{
           selectedSeries = el.dataset.series;
           seriesLabelEl.textContent = selectedSeries;
+          if (currentSeriesIdEl) currentSeriesIdEl.textContent = selectedSeries;
           renderMatches();
           loadSeries();
         }});
@@ -253,43 +353,111 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
     }}
 
     async function loadSeries() {{
+      if (!selectedSeries) return;
       const runData = currentRunData();
-      if (!runData || !selectedSeries) return;
-      const runPath = runData.run_dir || runData.run;
-      const seriesPath = `${{runPath}}/series_json/series/${{encodeURIComponent(selectedSeries.replaceAll("/", "__").replaceAll("\\\\", "__"))}}.json`;
+      const encodedId = encodeURIComponent(selectedSeries.replaceAll("/", "__").replaceAll("\\\\", "__"));
+      const baselinePath = `${{BASELINE_ROOT}}/series/${{encodedId}}.json`;
+      
       seriesLabelEl.textContent = `${{selectedSeries}} (loading...)`;
-      try {{
-        const response = await fetch(seriesPath, {{ cache: "no-store" }});
-        if (!response.ok) throw new Error(`Failed to load ${{seriesPath}}`);
-        currentPayload = await response.json();
-        seriesLabelEl.textContent = selectedSeries;
-        renderSeries();
-      }} catch (err) {{
-        console.error(err);
-        seriesLabelEl.textContent = `${{selectedSeries}} (failed to load)`;
+      currentPayload = null;
+      currentBaselinePayload = null;
+
+      const tasks = [
+        fetch(baselinePath, {{ cache: "no-store" }}).then(r => r.ok ? r.json() : null).catch(() => null)
+      ];
+
+      if (runData) {{
+        const runPath = runData.run_dir || runData.run;
+        const seriesPath = `${{runPath}}/series_json/series/${{encodedId}}.json`;
+        tasks.push(fetch(seriesPath, {{ cache: "no-store" }}).then(r => r.ok ? r.json() : null).catch(() => null));
       }}
+
+      const [baseline, runPayload] = await Promise.all(tasks);
+      currentBaselinePayload = baseline;
+      currentPayload = runPayload;
+
+      seriesLabelEl.textContent = selectedSeries + (currentPayload ? "" : " (Run data missing)");
+      if (currentSeriesIdEl) currentSeriesIdEl.textContent = selectedSeries;
+      renderSeries();
+    }}
+
+    async function loadRunWrmsse() {{
+      const runData = currentRunData();
+      currentWrmsse = null;
+      if (!runData) {{
+        renderAggregate();
+        return;
+      }}
+      const runPath = runData.run_dir || runData.run;
+      const wrmssePath = `${{runPath}}/series_json/wrmsse.json`;
+      try {{
+        const resp = await fetch(wrmssePath, {{ cache: "no-store" }});
+        if (resp.ok) {{
+          currentWrmsse = await resp.json();
+        }}
+      }} catch (e) {{
+        console.warn("Failed to load WRMSSE for run", e);
+      }}
+      renderAggregate();
     }}
 
     function renderSeries() {{
-      if (!currentPayload) return;
-      const modePayload = currentPayload.modes?.[selectedMode] || null;
-      if (!modePayload) return;
+      if (!currentPayload && !currentBaselinePayload) {{
+        metricsEl.innerHTML = "<div class='muted'>No data available for this series</div>";
+        return;
+      }}
+      
       const variant = variantEl.value;
-      const variantPayload = modePayload[variant] || modePayload.raw;
-      const actuals = currentPayload.actuals || [];
+      const modePayload = currentPayload?.modes?.[selectedMode] || null;
+      const variantPayload = modePayload?.[variant] || modePayload?.raw || null;
+      
+      const baselineNaive = currentBaselinePayload?.baselines?.naive || {{}};
+      const baselineSeasonal = currentBaselinePayload?.baselines?.seasonal_naive || {{}};
+      
+      const actuals = currentPayload?.actuals || currentBaselinePayload?.actuals || [];
       const forecast = variantPayload?.forecast || [];
       const metrics = variantPayload?.metrics || {{}};
-      const days = forecast.map((_, idx) => idx + 1);
+      
+      const naiveForecast = baselineNaive.forecast || [];
+      const seasonalForecast = baselineSeasonal.forecast || [];
+      const days = actuals.length ? actuals.map((_, idx) => idx + 1) : (forecast.length ? forecast.map((_, idx) => idx + 1) : []);
+
       metricsEl.innerHTML = `
         ${{metricCard("MAE", metrics.mae)}}
         ${{metricCard("MAPE", metrics.mape)}}
         ${{metricCard("RMSE", metrics.rmse)}}
         ${{metricCard("SMAPE", metrics.smape)}}
       `;
-      Plotly.react("chart", [
-        {{ x: days, y: actuals, type: "scatter", mode: "lines+markers", name: "Actual", line: {{ color: "#111827", width: 2 }} }},
-        {{ x: days, y: forecast, type: "scatter", mode: "lines+markers", name: selectedMode + " (" + variant + ")", line: {{ color: "#2563eb", width: 2 }} }}
-      ], {{
+      
+      const rows = [];
+      if (currentPayload) {{
+        rows.push(`<tr><td>DeepAR (${{selectedMode}}, ${{variant}})</td><td>${{fmt(metrics.mae)}}</td><td>${{fmt(metrics.mape)}}</td><td>${{fmt(metrics.rmse)}}</td><td>${{fmt(metrics.smape)}}</td><td>${{fmt(metrics.rmsse)}}</td></tr>`);
+      }} else {{
+        rows.push(`<tr><td colspan="6" class="muted">No DeepAR run data selected or found</td></tr>`);
+      }}
+      
+      rows.push(`<tr><td>Naive</td><td>${{fmt(baselineNaive.metrics?.mae)}}</td><td>${{fmt(baselineNaive.metrics?.mape)}}</td><td>${{fmt(baselineNaive.metrics?.rmse)}}</td><td>${{fmt(baselineNaive.metrics?.smape)}}</td><td>${{fmt(baselineNaive.metrics?.rmsse)}}</td></tr>`);
+      rows.push(`<tr><td>Seasonal naive</td><td>${{fmt(baselineSeasonal.metrics?.mae)}}</td><td>${{fmt(baselineSeasonal.metrics?.mape)}}</td><td>${{fmt(baselineSeasonal.metrics?.rmse)}}</td><td>${{fmt(baselineSeasonal.metrics?.smape)}}</td><td>${{fmt(baselineSeasonal.metrics?.rmsse)}}</td></tr>`);
+      
+      seriesMetricsBodyEl.innerHTML = rows.join("");
+
+      const traces = [];
+      if (actuals.length) {{
+        traces.push({{ x: days, y: actuals, type: "scatter", mode: "lines+markers", name: "Actual", line: {{ color: "#111827", width: 2 }} }});
+      }}
+
+      if (forecast.length) {{
+        traces.push({{ x: days, y: forecast, type: "scatter", mode: "lines+markers", name: "DeepAR (" + selectedMode + ")", line: {{ color: "#2563eb", width: 2 }} }});
+      }}
+
+      if (naiveForecast.length) {{
+        traces.push({{ x: days, y: naiveForecast, type: "scatter", mode: "lines+markers", name: "Naive", line: {{ color: "#dc2626", width: 2, dash: "dot" }} }});
+      }}
+      if (seasonalForecast.length) {{
+        traces.push({{ x: days, y: seasonalForecast, type: "scatter", mode: "lines+markers", name: "Seasonal naive", line: {{ color: "#16a34a", width: 2, dash: "dash" }} }});
+      }}
+
+      Plotly.react("chart", traces, {{
         margin: {{ l: 55, r: 20, t: 20, b: 45 }},
         paper_bgcolor: "#ffffff",
         plot_bgcolor: "#ffffff",
@@ -311,12 +479,8 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
 
     runSelect.addEventListener("change", () => {{
       selectedRun = runSelect.value;
-      const runData = currentRunData();
-      runLabelEl.textContent = selectedRun;
-      queryEl.value = "";
-      selectedSeries = runData?.series_ids?.[0] || "";
-      seriesLabelEl.textContent = selectedSeries;
-      renderAggregate();
+      runLabelEl.textContent = selectedRun || "None";
+      loadRunWrmsse();
       renderMatches();
       loadSeries();
     }});
@@ -325,7 +489,8 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
     variantEl.addEventListener("change", renderSeries);
     document.getElementById("reload").addEventListener("click", loadSeries);
 
-    renderAggregate();
+    loadRunWrmsse();
+    renderBaselines();
     renderMatches();
     if (selectedSeries) {{
       loadSeries().catch((err) => console.error(err));
@@ -342,8 +507,6 @@ def main() -> None:
     if not root.exists():
         raise FileNotFoundError(root)
     manifest = build_manifest(root)
-    if not manifest:
-        raise FileNotFoundError(f"No runs with series_json artifacts found under {root}")
     output_html = Path(args.output_html) if args.output_html else root / "experiment_viewer.html"
     output_html.write_text(build_html(root, manifest), encoding="utf-8")
     print(f"Wrote {output_html}")
