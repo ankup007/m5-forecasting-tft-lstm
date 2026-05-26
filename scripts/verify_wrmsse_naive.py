@@ -6,10 +6,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import sys
+
+# Add the project root's src directory to sys.path
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 from deepar_m5.data import DataConfig, load_m5_bundle
 from deepar_m5.evaluation import compute_holdout_metrics, load_holdout_actuals
 from deepar_m5.utils import configure_logging
+
 
 logger = logging.getLogger(__name__)
 

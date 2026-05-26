@@ -1,6 +1,6 @@
 {
   "series_id": "HOUSEHOLD_1_176_CA_2_validation",
-  "run": "run_20260524_085747_563601_001_subset34590_ctx56_h16_emb8_ep10_steps100",
+  "source_run": "run_20260524_085747_563601_001_subset34590_ctx56_h16_emb8_ep10_steps100",
   "horizon": [
     1,
     2,

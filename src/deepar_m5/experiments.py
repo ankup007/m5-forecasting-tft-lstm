@@ -40,14 +40,14 @@ def run_name(index: int, params: dict[str, int | float | str]) -> str:
 # Define your hyperparameter grid here for sweeps
 GRID_CONFIG = {
     "subset_size": [34590],
-    "context_length": [84, 112],
+    "context_length": [84],
     "batch_size": [1024],
     "epochs": [20],
     "steps_per_epoch": [100],
-    "hidden_size": [16],
+    "hidden_size": [64],
     "embedding_dim": [8],
-    "num_layers": [1,2],
-    "dropout": [0.0],
+    "num_layers": [2],
+    "dropout": [0.1],
     "learning_rate": [0.001],
     "seed": [42],
 }

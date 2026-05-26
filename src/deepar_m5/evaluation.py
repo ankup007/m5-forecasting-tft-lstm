@@ -48,7 +48,7 @@ def forecast_multi_summaries(
         batch_to_move = sampler.make_inference_batch(series_idx)
         batch = {
             "target": torch.as_tensor(batch_to_move["target"], dtype=torch.float32, device=device),
-            "prior_target": torch.as_tensor(batch_to_move["prior_target"], dtype=torch.float32, device=device),
+            "prior_history": torch.as_tensor(batch_to_move["prior_history"], dtype=torch.float32, device=device),
             "covariates": torch.as_tensor(batch_to_move["covariates"], dtype=torch.float32, device=device),
             "static_cats": torch.as_tensor(batch_to_move["static_cats"], dtype=torch.long, device=device),
             "scale": torch.as_tensor(batch_to_move["scale"], dtype=torch.float32, device=device),
@@ -62,7 +62,7 @@ def forecast_multi_summaries(
                 batch["static_cats"],
                 batch["scale"],
                 context_length=data_config.context_length,
-                prior_target=batch["prior_target"],
+                prior_history=batch["prior_history"],
             )
             results["mean"][series_idx] = pred_mean.clamp_min(0.0).cpu().numpy()
             
@@ -74,7 +74,7 @@ def forecast_multi_summaries(
                 batch["scale"],
                 context_length=data_config.context_length,
                 num_samples=num_samples,
-                prior_target=batch["prior_target"],
+                prior_history=batch["prior_history"],
             )
             samples = samples.clamp_min(0.0)
             
@@ -121,12 +121,31 @@ def load_holdout_actuals(
 
 
 def rmsse_denominators(train_values: np.ndarray) -> np.ndarray:
-    """Compute per-series RMSSE denominators from the training target history."""
+    """Compute per-series RMSSE denominators from the training target history.
+    
+    In accordance with M5 rules, the denominator is calculated only for the 
+    time period after the first non-zero demand.
+    """
 
-    diffs = np.diff(train_values.astype(np.float64), axis=1)
-    denom = np.mean(np.square(diffs), axis=1)
-    # Floor at 1e-12 to avoid division by zero for flat series.
-    return np.clip(denom, 1e-12, None)
+    denoms = []
+    for i in range(train_values.shape[0]):
+        series = train_values[i].astype(np.float64)
+        # Find first non-zero index
+        nonzero_indices = np.nonzero(series)[0]
+        if len(nonzero_indices) == 0:
+            # Fallback for all-zero series
+            diffs = np.diff(series)
+        else:
+            first_nonzero = nonzero_indices[0]
+            # Use only the period after first non-zero demand
+            diffs = np.diff(series[first_nonzero:])
+        
+        if len(diffs) == 0:
+            denoms.append(1.0) # Fallback for single-point series
+        else:
+            denoms.append(np.mean(np.square(diffs)))
+            
+    return np.clip(np.array(denoms), 1e-12, None)
 
 
 def _aggregate_to_levels(

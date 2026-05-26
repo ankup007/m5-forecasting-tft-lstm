@@ -76,12 +76,10 @@ class DeepAR(nn.Module):
         self.embeddings = nn.ModuleList(
                 [nn.Embedding(c, get_emb_dim(c)) for c in config.cardinalities]
             )
-        # self.embeddings = nn.ModuleList(
-        #     [nn.Embedding(cardinality, config.embedding_dim) for cardinality in config.cardinalities]
-        # )
         static_dim = sum(get_emb_dim(c) for c in config.cardinalities)
-        #static_dim = len(config.cardinalities) * config.embedding_dim
-        input_size = 1 + config.covariate_dim + static_dim + 1
+        # Input: prev_scaled_target(1), dynamic_lag_7(1), dynamic_roll_7(1), covariates(dim), static(dim), scale(1)
+        # We add 2 to the input_size for lag_7 and rolling_mean_7
+        input_size = 1 + 2 + config.covariate_dim + static_dim + 1
 
         cells = [] 
         for layer_idx in range(config.num_layers):
@@ -115,6 +113,7 @@ class DeepAR(nn.Module):
     def _step(
         self,
         prev_scaled_target: torch.Tensor,
+        target_history: torch.Tensor,
         covariates_t: torch.Tensor,
         static_emb: torch.Tensor,
         log_scale: torch.Tensor,
@@ -122,8 +121,15 @@ class DeepAR(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Run one autoregressive step and produce negative-binomial parameters."""
 
-        x = torch.cat([prev_scaled_target, covariates_t, static_emb, log_scale], dim=-1)
-        # logger.info(f"x shape: {x.shape}")
+        # target_history shape: [batch, 28] (or whatever buffer size we chose)
+        # We need lag_7 and rolling_mean_7 (last 7 days)
+        # target_history contains the most recent predictions/targets up to t-1
+        
+        lag_7 = target_history[:, -7 : -6]
+        roll_7 = target_history[:, -7:].mean(dim=1, keepdim=True)
+
+        x = torch.cat([prev_scaled_target, lag_7, roll_7, covariates_t, static_emb, log_scale], dim=-1)
+        
         next_states = []
         for layer_idx, cell in enumerate(self.cells):
             h, c = cell(x, states[layer_idx])
@@ -131,7 +137,6 @@ class DeepAR(nn.Module):
             next_states.append((h, c))
 
         raw = self.output(x)
-        # logger.info(f"raw shape: {raw.shape}")
         mu_scaled = F.softplus(raw[:, :1]) + 1e-4
         alpha = F.softplus(raw[:, 1:2]) + 1e-4
         return mu_scaled, alpha, next_states
@@ -142,41 +147,42 @@ class DeepAR(nn.Module):
         covariates: torch.Tensor,
         static_cats: torch.Tensor,
         scale: torch.Tensor,
-        prior_target: torch.Tensor | None = None,
+        prior_history: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run teacher-forced training over a full context-plus-horizon window."""
 
         batch_size, seq_len = target.shape
-        # logger.info(f"target_shape: {target.shape}")
-        # logger.info(f"batch_size: {batch_size}, seq_len: {seq_len}")
-        # logger.info(f"shape static_cats: {static_cats.shape}")
         static_emb = self.static_embedding(static_cats)
-        # logger.info(f"shape static_embed: {static_emb.shape}")
-        # logger.info(f"shape scale: {scale.shape}")
         log_scale = torch.log1p(scale)
         states = self.initial_state(batch_size, target.device)
-        # logger.info(f"initial states shape: {len(states)}")
 
-        if prior_target is not None:
-            prev_scaled = prior_target.unsqueeze(1) / scale.clamp_min(1e-4)
-        else:
-            logger.info("prior target is not given - forecasts will be affected!!!")
-            prev_scaled = torch.zeros(batch_size, 1, device=target.device)
+        if prior_history is None:
+            logger.warning("prior_history is not given - initialization will be affected!")
+            prior_history = torch.zeros(batch_size, 28, device=target.device)
+        
+        # history buffer scaled
+        history = prior_history / scale.clamp_min(1e-4)
         
         mus = []
         alphas = []
         for step in range(seq_len):
-            # logger.info(f"processing: step: {step}/{seq_len}")
+            prev_scaled = history[:, -1:]
             mu_scaled, alpha, states = self._step(
                 prev_scaled,
+                history,
                 covariates[:, step, :],
                 static_emb,
                 log_scale,
                 states,
             )
+            logger.info(f"forward: mu shape : {mu_scaled.shape}")
+            logger.info(f"forward: alpha shape : {alpha.shape}")
             mus.append(mu_scaled * scale)
             alphas.append(alpha)
-            prev_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+            
+            # Update history with ground truth (teacher forcing)
+            next_target_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+            history = torch.cat([history[:, 1:], next_target_scaled], dim=1)
 
         return torch.cat(mus, dim=1), torch.cat(alphas, dim=1)
 
@@ -188,7 +194,7 @@ class DeepAR(nn.Module):
         static_cats: torch.Tensor,
         scale: torch.Tensor,
         context_length: int,
-        prior_target: torch.Tensor | None = None,
+        prior_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode future means autoregressively after consuming known context."""
 
@@ -197,27 +203,33 @@ class DeepAR(nn.Module):
         log_scale = torch.log1p(scale)
         states = self.initial_state(batch_size, target.device)
 
-        if prior_target is not None:
-            prev_scaled = prior_target.unsqueeze(1) / scale.clamp_min(1e-4)
-        else:
-            logger.info("prior target is not given - forecasts will be affected!!!")
-            prev_scaled = torch.zeros(batch_size, 1, device=target.device)
+        if prior_history is None:
+            prior_history = torch.zeros(batch_size, 28, device=target.device)
+        
+        history = prior_history / scale.clamp_min(1e-4)
 
         predictions = []
         for step in range(seq_len):
+            prev_scaled = history[:, -1:]
             mu_scaled, _, states = self._step(
                 prev_scaled,
+                history,
                 covariates[:, step, :],
                 static_emb,
                 log_scale,
                 states,
             )
+            logger.info(f"predict mean: mu shape : {mu_scaled.shape}")
             mu = mu_scaled * scale
+            
             if step >= context_length:
                 predictions.append(mu)
-                prev_scaled = mu_scaled
+                # Update history with prediction
+                history = torch.cat([history[:, 1:], mu_scaled], dim=1)
             else:
-                prev_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+                # Consume context (update history with ground truth)
+                next_target_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+                history = torch.cat([history[:, 1:], next_target_scaled], dim=1)
 
         return torch.cat(predictions, dim=1)
 
@@ -230,7 +242,7 @@ class DeepAR(nn.Module):
         scale: torch.Tensor,
         context_length: int,
         num_samples: int,
-        prior_target: torch.Tensor | None = None,
+        prior_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Optimized decoding that avoids redundant context computation."""
 
@@ -240,45 +252,44 @@ class DeepAR(nn.Module):
         batch_size, seq_len = target.shape
         horizon_length = seq_len - context_length
 
-        # ------------------------------------------------------------------
-        # PHASE 1: CONSUME CONTEXT (NO DUPLICATION YET)
-        # ------------------------------------------------------------------
         static_emb = self.static_embedding(static_cats)
         log_scale = torch.log1p(scale)
         states = self.initial_state(batch_size, target.device)
         
-        if prior_target is not None:
-            prev_scaled = prior_target.unsqueeze(1) / scale.clamp_min(1e-4)
-        else:
-            logger.info("prior target is not given - forecasts will be affected!!!")
-            prev_scaled = torch.zeros(batch_size, 1, device=target.device)
+        if prior_history is None:
+            prior_history = torch.zeros(batch_size, 28, device=target.device)
+        
+        history = prior_history / scale.clamp_min(1e-4)
 
-        # Walk through the known history efficiently (only processing `batch_size`)
+        # ------------------------------------------------------------------
+        # PHASE 1: CONSUME CONTEXT
+        # ------------------------------------------------------------------
         for step in range(context_length):
+            prev_scaled = history[:, -1:]
             mu_scaled, alpha, states = self._step(
                 prev_scaled,
+                history,
                 covariates[:, step, :],
                 static_emb,
                 log_scale,
                 states,
             )
-            prev_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+            logger.info(f"predict samples step < context - mu shape : {mu_scaled.shape}")
+            next_target_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+            history = torch.cat([history[:, 1:], next_target_scaled], dim=1)
 
         # ------------------------------------------------------------------
-        # THE SPLIT: CLONE THE WORLD INTO `num_samples` PARALLEL UNIVERSES
+        # THE SPLIT: CLONE THE WORLD
         # ------------------------------------------------------------------
-        # We clone the final context states. Instead of 32 sequences, we now have 3200.
         def duplicate(tensor: torch.Tensor) -> torch.Tensor:
             return tensor.repeat_interleave(num_samples, dim=0)
 
-        # Duplicate the LSTM hidden and cell states for every layer
         expanded_states = []
         for h, c in states:
             expanded_states.append((duplicate(h), duplicate(c)))
         states = expanded_states
 
-        # Duplicate the inputs for the horizon
-        prev_scaled = duplicate(prev_scaled)
+        history = duplicate(history)
         static_emb = duplicate(static_emb)
         log_scale = duplicate(log_scale)
         repeated_scale = duplicate(scale)
@@ -289,20 +300,23 @@ class DeepAR(nn.Module):
         # ------------------------------------------------------------------
         samples = []
         for step in range(horizon_length):
+            prev_scaled = history[:, -1:]
             mu_scaled, alpha, states = self._step(
                 prev_scaled,
+                history,
                 repeated_covariates[:, step, :],
                 static_emb,
                 log_scale,
                 states,
             )
-            
+            logger.info(f"predict samples step > context - mu shape : {mu_scaled.shape}")
             mu = mu_scaled * repeated_scale
             sample = sample_negative_binomial(mu, alpha)
             samples.append(sample)
             
-            # Feed the random sample back in for the next autoregressive step
-            prev_scaled = sample / repeated_scale.clamp_min(1e-4)
+            # Update history with prediction (sample)
+            sample_scaled = sample / repeated_scale.clamp_min(1e-4)
+            history = torch.cat([history[:, 1:], sample_scaled], dim=1)
 
         stacked = torch.cat(samples, dim=1)
         return stacked.view(batch_size, num_samples, -1).transpose(0, 1).contiguous()

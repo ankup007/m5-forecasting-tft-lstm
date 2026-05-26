@@ -254,29 +254,46 @@ def _build_covariate_cube(
 ) -> tuple[np.ndarray, list[str]]:
     """Create the full ``series x day x feature`` known-covariate tensor.
 
-    The model receives known future features alongside historical targets. This
-    combines calendar features shared by every series, a state-specific SNAP
-    indicator, and item-store price features into one cube aligned to the M5 day
-    index.
+    Allocates the full tensor once and fills it in-place to minimize peak 
+    memory usage during broad-dataset runs.
     """
 
-    common, names = _common_calendar_covariates(calendar)
-    logger.debug("Common calendar covariates before broadcast=%s", common.shape)
-    common = np.broadcast_to(common[None, :, :], (len(sales_frame), common.shape[0], common.shape[1]))
-    logger.debug("Common calendar covariates after broadcast=%s", common.shape)
-    snap = np.zeros((len(sales_frame), len(calendar), 1), dtype=np.float32)
-    logger.debug("SNAP covariate shape=%s", snap.shape)
-    for row_idx, state_id in enumerate(sales_frame["state_id"].astype(str)):
-        snap_column = f"snap_{state_id}"
-        snap[row_idx, :, 0] = calendar[snap_column].astype(np.float32).to_numpy()
-
-    log_prices, price_missing = _build_price_covariates(sales_frame, calendar, prices)
-    price_covariates = np.stack([log_prices, price_missing], axis=2)
-    covariates = np.concatenate([common.astype(np.float32), snap, price_covariates], axis=2)
+    num_series = len(sales_frame)
+    num_days = len(calendar)
+    common_data, names = _common_calendar_covariates(calendar)
+    num_common = common_data.shape[1]
+    
+    # Pre-allocate the entire cube (11 features total: 8 calendar + 1 snap + 2 price)
     covariate_names = names + ["snap_state", "log_sell_price", "price_missing"]
+    covariates = np.zeros((num_series, num_days, len(covariate_names)), dtype=np.float32)
+    
+    logger.debug("Allocated covariate cube: %s", covariates.shape)
+
+    # 1. Fill shared calendar features (Broadcasting)
+    # This fills the first 8 features for all series at once without a full copy
+    covariates[:, :, :num_common] = common_data[None, :, :]
+    
+    # 2. Fill SNAP features (State-specific)
+    # Pre-calculate SNAP arrays for each state
+    snap_map = {}
+    for state in ["CA", "TX", "WI"]:
+        snap_map[state] = calendar[f"snap_{state}"].astype(np.float32).to_numpy()
+    
+    # Apply snap based on series state
+    state_ids = sales_frame["state_id"].astype(str).to_numpy()
+    for state, snap_arr in snap_map.items():
+        mask = (state_ids == state)
+        if mask.any():
+            # Use broadcasting to fill the 9th feature (index 8) for series in this state
+            covariates[mask, :, num_common] = snap_arr[None, :]
+
+    # 3. Fill Price features (Series-specific)
+    log_prices, price_missing = _build_price_covariates(sales_frame, calendar, prices)
+    covariates[:, :, num_common + 1] = log_prices
+    covariates[:, :, num_common + 2] = price_missing
+
     logger.info("Built covariate cube shape=%s with features=%s", covariates.shape, covariate_names)
-    logger.debug("Price covariates shape=%s; final covariates dtype=%s", price_covariates.shape, covariates.dtype)
-    return covariates.astype(np.float32), covariate_names
+    return covariates, covariate_names
 
 
 def _series_scales(values: np.ndarray, train_end: int) -> np.ndarray:
@@ -301,6 +318,27 @@ def _series_scales(values: np.ndarray, train_end: int) -> np.ndarray:
         float(scales.max()),
     )
     return scales
+
+
+def _calculate_lags(values: np.ndarray, scales: np.ndarray, num_calendar_days: int) -> tuple[np.ndarray, list[str]]:
+    """Compute scaled lag-28 features for each series.
+    
+    Lag-28 is a known covariate for the 28-day M5 forecast horizon.
+    Lag-7 and rolling features must be calculated dynamically during the 
+    autoregressive rollout to use predicted values.
+    """
+
+    num_series, num_days = values.shape
+    scales_expanded = np.maximum(scales.reshape(-1, 1), 1e-4)
+    scaled_values = values / scales_expanded
+
+    lags = np.zeros((num_series, num_calendar_days, 1), dtype=np.float32)
+
+    # Lag 28: available for t in [28, num_days + 27]
+    max_t_lag28 = min(num_calendar_days, num_days + 28)
+    lags[:, 28:max_t_lag28, 0] = scaled_values[:, : max_t_lag28 - 28]
+
+    return lags, ["lag_28"]
 
 
 def load_m5_bundle(
@@ -354,9 +392,13 @@ def load_m5_bundle(
     train_end = max(1, sales_values.shape[1] - config.prediction_length)
     scales = _series_scales(sales_values, train_end=train_end)
     static_cats = encode_static(sales, encoders)
-    
+
     if load_covariates:
         covariates, covariate_columns = _build_covariate_cube(sales, calendar, prices)
+        # Add lag and rolling mean features
+        lag_covs, lag_names = _calculate_lags(sales_values, scales, calendar.shape[0])
+        covariates = np.concatenate([covariates, lag_covs], axis=2)
+        covariate_columns += lag_names
     else:
         covariates = np.zeros((0, 0, 0), dtype=np.float32)
         covariate_columns = []
@@ -479,16 +521,18 @@ class WindowSampler:
         targets = np.zeros((len(series_idx), self.sequence_length), dtype=np.float32)
         targets[:, : self.context_length] = self.bundle.sales_values[series_idx, start:forecast_start]
 
-        # Extract target from the day before the window starts (prior_target)
-        # If start == 0, there is no prior history, so we use zero.
-        if start > 0:
-            prior_target = self.bundle.sales_values[series_idx, start - 1]
-        else:
-            prior_target = np.zeros(len(series_idx), dtype=np.float32)
+        # Extract 28 days of history before the window starts (prior_history)
+        history_len = 28
+        prior_history = np.zeros((len(series_idx), history_len), dtype=np.float32)
+        for i, idx in enumerate(series_idx):
+            h_start = max(0, start - history_len)
+            h_end = start
+            h_data = self.bundle.sales_values[idx, h_start:h_end]
+            prior_history[i, history_len - len(h_data) :] = h_data
 
         batch = {
             "target": targets,
-            "prior_target": prior_target,
+            "prior_history": prior_history,
             "covariates": self.bundle.covariates[series_idx[:, None], positions[None, :]],
             "static_cats": self.bundle.static_cats[series_idx],
             "scale": self.bundle.scales[series_idx, None],
@@ -519,18 +563,20 @@ class WindowSampler:
         positions = starts[:, None] + offsets[None, :]
         targets = self.bundle.sales_values[series_idx[:, None], positions]
 
-        # Extract target from the day before each window starts (prior_target)
-        # For each sample in the batch, check if its start index allows for a prior day.
-        prior_target = np.zeros(len(series_idx), dtype=np.float32)
+        # Extract 28 days of history before the window starts (prior_history)
+        history_len = 28
+        prior_history = np.zeros((len(series_idx), history_len), dtype=np.float32)
         for i, (s_idx, start) in enumerate(zip(series_idx, starts)):
-            if start > 0:
-                prior_target[i] = self.bundle.sales_values[s_idx, start - 1]
+            h_start = max(0, start - history_len)
+            h_end = start
+            h_data = self.bundle.sales_values[s_idx, h_start:h_end]
+            prior_history[i, history_len - len(h_data) :] = h_data
 
         loss_mask = np.zeros_like(targets, dtype=np.float32)
         loss_mask[:, self.context_length :] = 1.0
         return {
             "target": targets.astype(np.float32),
-            "prior_target": prior_target.astype(np.float32),
+            "prior_history": prior_history.astype(np.float32),
             "covariates": self.bundle.covariates[series_idx[:, None], positions].astype(np.float32),
             "static_cats": self.bundle.static_cats[series_idx].astype(np.int64),
             "scale": self.bundle.scales[series_idx, None].astype(np.float32),
@@ -542,10 +588,10 @@ class WindowSampler:
         """Log the tensor-like shapes in a sampled batch for debugging."""
 
         logger.debug(
-            "%s batch shapes: target=%s prior_target=%s covariates=%s static_cats=%s scale=%s loss_mask=%s series_idx=%s",
+            "%s batch shapes: target=%s prior_history=%s covariates=%s static_cats=%s scale=%s loss_mask=%s series_idx=%s",
             name,
             batch["target"].shape,
-            batch.get("prior_target", np.array([])).shape,
+            batch.get("prior_history", np.array([])).shape,
             batch["covariates"].shape,
             batch["static_cats"].shape,
             batch["scale"].shape,

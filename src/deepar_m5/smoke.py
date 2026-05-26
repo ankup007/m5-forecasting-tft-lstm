@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
         batch["covariates"],
         batch["static_cats"],
         batch["scale"],
-        prior_target=batch.get("prior_target"),
+        prior_history=batch.get("prior_history"),
     )
     loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
     assert torch.isfinite(loss), "loss is not finite"
@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> None:
         infer_batch["static_cats"],
         infer_batch["scale"],
         context_length=args.context_length,
-        prior_target=infer_batch.get("prior_target"),
+        prior_history=infer_batch.get("prior_history"),
     )
     assert pred.shape == (min(3, bundle.num_series), args.prediction_length)
     assert torch.all(pred >= 0)
@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> None:
         infer_batch["scale"],
         context_length=args.context_length,
         num_samples=4,
-        prior_target=infer_batch.get("prior_target"),
+        prior_history=infer_batch.get("prior_history"),
     )
     assert samples.shape == (4, min(3, bundle.num_series), args.prediction_length)
     assert torch.all(samples >= 0)

@@ -38,7 +38,7 @@ def evaluate(model: DeepAR, sampler: WindowSampler, batch_size: int, device: tor
                 batch["covariates"],
                 batch["static_cats"],
                 batch["scale"],
-                prior_target=batch.get("prior_target"),
+                prior_history=batch.get("prior_history"),
             )
             loss_sum = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
             weight = float(batch["loss_mask"].sum().item())
@@ -103,7 +103,7 @@ def train_epoch(
             batch["covariates"],
             batch["static_cats"],
             batch["scale"],
-            prior_target=batch.get("prior_target"),
+            prior_history=batch.get("prior_history"),
         )
         loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
         loss.backward()
@@ -129,6 +129,7 @@ def save_artifacts(
     bundle,
     data_config: DataConfig,
     model: DeepAR,
+    args: argparse.Namespace,
 ) -> None:
     """Save configuration and metadata files needed for later inference."""
 
@@ -136,6 +137,25 @@ def save_artifacts(
     save_json(artifact_dir / "encoders.json", bundle.encoders)
     save_json(artifact_dir / "data_config.json", config_to_dict(data_config))
     save_json(artifact_dir / "model_config.json", model.to_config_dict())
+    
+    # Save a unified run_config.json with key hyperparameters for easy reference
+    run_config = {
+        "subset_size": getattr(args, "subset_size", data_config.subset_size),
+        "context_length": getattr(args, "context_length", data_config.context_length),
+        "prediction_length": getattr(args, "prediction_length", data_config.prediction_length),
+        "batch_size": getattr(args, "batch_size", 128),
+        "epochs": getattr(args, "epochs", 10),
+        "steps_per_epoch": getattr(args, "steps_per_epoch", 200),
+        "hidden_size": getattr(args, "hidden_size", 64),
+        "embedding_dim": getattr(args, "embedding_dim", 16),
+        "num_layers": getattr(args, "num_layers", 1),
+        "dropout": getattr(args, "dropout", 0.0),
+        "learning_rate": getattr(args, "learning_rate", 1e-3),
+        "grad_clip": getattr(args, "grad_clip", 10.0),
+        "seed": getattr(args, "seed", 42),
+    }
+    save_json(artifact_dir / "run_config.json", run_config)
+    
     bundle.sales_frame[["id", *["item_id", "dept_id", "cat_id", "store_id", "state_id"]]].to_csv(
         artifact_dir / "selected_series.csv",
         index=False,
@@ -342,7 +362,7 @@ def run_training(args: argparse.Namespace, wandb_run=None) -> tuple[DeepAR, list
             "device_resolved": str(device),
         }, allow_val_change=True)
 
-    save_artifacts(artifact_dir, bundle, data_config, model)
+    save_artifacts(artifact_dir, bundle, data_config, model, args)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     
     best_val_loss = float("inf")
