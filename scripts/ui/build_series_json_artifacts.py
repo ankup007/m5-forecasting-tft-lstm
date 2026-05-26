@@ -10,7 +10,7 @@ import pandas as pd
 from tqdm import tqdm
 
 
-MODE_ORDER = ["mean", "sample-mean", "p25", "p50", "p75"]
+MODE_ORDER = ["mean", "sample-mean"]
 VARIANTS = ["raw", "rounded"]
 SERIES_METRICS = ["mae", "mape", "rmse", "smape", "rmsse"]
 

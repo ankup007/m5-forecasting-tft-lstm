@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-MODE_ORDER = ["mean", "sample-mean", "p25", "p50", "p75"]
+MODE_ORDER = ["mean", "sample-mean"]
 VARIANTS = ["raw", "rounded"]
 SEARCH_LIMIT = 100
 
@@ -69,6 +69,7 @@ def load_global_baseline(root: Path) -> dict[str, Any]:
     baseline_path = root / "naive_forecasts" / "run_summary.json"
     index_path = root / "naive_forecasts" / "series_index.json"
     data = load_json(baseline_path) if baseline_path.exists() else {}
+    data.pop("package_compare", None)
     if index_path.exists():
         data["series_ids"] = load_json(index_path).get("series_ids", [])
     return data
@@ -156,7 +157,7 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
       <h2>Global Baseline Reference</h2>
       <div class="muted" id="baseline-note" style="margin-bottom:12px;">Reference forecasts (Naive and Seasonal Naive) are computed once for the dataset.</div>
       <table class="table">
-        <thead><tr><th>Baseline</th><th>MAE</th><th>MAPE</th><th>RMSE</th><th>SMAPE</th><th>RMSSE</th><th>WRMSSE</th><th>Package WRMSSE</th></tr></thead>
+        <thead><tr><th>Baseline</th><th>MAE</th><th>MAPE</th><th>RMSE</th><th>SMAPE</th><th>RMSSE</th><th>WRMSSE</th></tr></thead>
         <tbody id="baseline-body"></tbody>
       </table>
     </div>
@@ -166,6 +167,18 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
         <div class="field">
           <label for="run-select">Selected DeepAR Run</label>
           <select id="run-select">{run_options}</select>
+        </div>
+        <div class="field">
+          <label for="dept-filter">Department filter</label>
+          <select id="dept-filter">
+            <option value="">All departments</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="store-filter">Store filter</label>
+          <select id="store-filter">
+            <option value="">All stores</option>
+          </select>
         </div>
         <div class="field">
           <label for="query">Series search</label>
@@ -204,9 +217,6 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
         <strong>Forecast mode</strong>
         <button data-mode="mean" class="mode active">mean</button>
         <button data-mode="sample-mean" class="mode">sample-mean</button>
-        <button data-mode="p25" class="mode">p25</button>
-        <button data-mode="p50" class="mode">p50</button>
-        <button data-mode="p75" class="mode">p75</button>
       </div>
       <div id="metrics" class="metrics"></div>
       <div style="margin-top:12px;">
@@ -228,6 +238,8 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
     const ALL_SERIES_IDS = DATA.all_series_ids || [];
     
     const runSelect = document.getElementById("run-select");
+    const deptFilterEl = document.getElementById("dept-filter");
+    const storeFilterEl = document.getElementById("store-filter");
     const queryEl = document.getElementById("query");
     const matchesEl = document.getElementById("matches");
     const variantEl = document.getElementById("variant");
@@ -258,6 +270,45 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
 
     function currentRunData() {{
       return RUNS.find((run) => run.run === selectedRun) || null;
+    }}
+
+    function parseSeriesFilters(seriesId) {{
+      const parts = String(seriesId || "").split("_");
+      if (parts.length < 6) return {{ dept: "", store: "" }};
+      return {{
+        dept: `${{parts[0]}}_${{parts[1]}}`,
+        store: `${{parts[parts.length - 3]}}_${{parts[parts.length - 2]}}`,
+      }};
+    }}
+
+    function filterOptionSets() {{
+      const runData = currentRunData();
+      const ids = runData?.series_ids || ALL_SERIES_IDS || [];
+      const depts = new Set();
+      const stores = new Set();
+      for (const id of ids) {{
+        const parsed = parseSeriesFilters(id);
+        if (parsed.dept) depts.add(parsed.dept);
+        if (parsed.store) stores.add(parsed.store);
+      }}
+      return {{
+        depts: Array.from(depts).sort(),
+        stores: Array.from(stores).sort(),
+      }};
+    }}
+
+    function renderFilterOptions() {{
+      const opts = filterOptionSets();
+      const currentDept = deptFilterEl.value;
+      const currentStore = storeFilterEl.value;
+
+      deptFilterEl.innerHTML = `<option value="">All departments</option>` +
+        opts.depts.map((dept) => `<option value="${{dept}}">${{dept}}</option>`).join("");
+      storeFilterEl.innerHTML = `<option value="">All stores</option>` +
+        opts.stores.map((store) => `<option value="${{store}}">${{store}}</option>`).join("");
+
+      if (opts.depts.includes(currentDept)) deptFilterEl.value = currentDept;
+      if (opts.stores.includes(currentStore)) storeFilterEl.value = currentStore;
     }}
 
     function renderAggregate() {{
@@ -298,9 +349,8 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
         naive: GLOBAL_BASELINE.naive,
         seasonal_naive: GLOBAL_BASELINE.seasonal_naive,
       }};
-      const packageCompare = GLOBAL_BASELINE.package_compare || {{}};
       if (!Object.keys(baselines || {{}}).length) {{
-        baselineBodyEl.innerHTML = "<tr><td colspan='8'>No baseline summary found</td></tr>";
+        baselineBodyEl.innerHTML = "<tr><td colspan='7'>No baseline summary found</td></tr>";
         baselineNoteEl.textContent = "Baseline artifacts are not available.";
         return;
       }}
@@ -308,7 +358,6 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
       for (const key of ["naive", "seasonal_naive"]) {{
         const metrics = baselines?.[key];
         if (!metrics) continue;
-        const packageValue = packageCompare?.[`${{key}}_wrmsse`];
         rows.push(`
           <tr>
             <td>${{key.replace("_", " ")}}</td>
@@ -318,26 +367,36 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
             <td>${{fmt(metrics.smape)}}</td>
             <td>${{fmt(metrics.rmsse)}}</td>
             <td>${{fmt(metrics.wrmsse)}}</td>
-            <td>${{fmt(packageValue)}}</td>
           </tr>
         `);
       }}
-      baselineBodyEl.innerHTML = rows.join("") || "<tr><td colspan='8'>No baseline summary found</td></tr>";
-      if (packageCompare?.note) baselineNoteEl.textContent = packageCompare.note;
-      else if (packageCompare?.error) baselineNoteEl.textContent = `Package comparison unavailable: ${{packageCompare.error}}`;
-      else baselineNoteEl.textContent = "Global reference forecasts (Naive and Seasonal Naive) are computed once for the dataset.";
+      baselineBodyEl.innerHTML = rows.join("") || "<tr><td colspan='7'>No baseline summary found</td></tr>";
+      baselineNoteEl.textContent = "Global reference forecasts (Naive and Seasonal Naive) are computed once for the dataset.";
     }}
 
     function makeMatches(query) {{
       const runData = currentRunData();
       const ids = runData?.series_ids || ALL_SERIES_IDS || [];
       const cleaned = (query || "").trim().toLowerCase();
-      const matches = cleaned ? ids.filter((id) => id.toLowerCase().includes(cleaned)) : ids.slice(0, {SEARCH_LIMIT});
+      const selectedDept = deptFilterEl.value;
+      const selectedStore = storeFilterEl.value;
+      const matches = ids.filter((id) => {{
+        const parsed = parseSeriesFilters(id);
+        if (selectedDept && parsed.dept !== selectedDept) return false;
+        if (selectedStore && parsed.store !== selectedStore) return false;
+        if (cleaned && !id.toLowerCase().includes(cleaned)) return false;
+        return true;
+      }});
       return matches.slice(0, {SEARCH_LIMIT});
     }}
 
     function renderMatches() {{
       const ids = makeMatches(queryEl.value);
+      if (ids.length && !ids.includes(selectedSeries)) {{
+        selectedSeries = ids[0];
+        seriesLabelEl.textContent = selectedSeries;
+        if (currentSeriesIdEl) currentSeriesIdEl.textContent = selectedSeries;
+      }}
       matchesEl.innerHTML = ids.map((id) => `
         <div class="match ${{id === selectedSeries ? 'active' : ''}}" data-series="${{id}}">${{id}}</div>
       `).join("") || '<div class="match muted">No matches</div>';
@@ -480,17 +539,27 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
     runSelect.addEventListener("change", () => {{
       selectedRun = runSelect.value;
       runLabelEl.textContent = selectedRun || "None";
+      renderFilterOptions();
       loadRunWrmsse();
       renderMatches();
       loadSeries();
     }});
 
     queryEl.addEventListener("input", renderMatches);
+    deptFilterEl.addEventListener("change", () => {{
+      renderMatches();
+      loadSeries();
+    }});
+    storeFilterEl.addEventListener("change", () => {{
+      renderMatches();
+      loadSeries();
+    }});
     variantEl.addEventListener("change", renderSeries);
     document.getElementById("reload").addEventListener("click", loadSeries);
 
     loadRunWrmsse();
     renderBaselines();
+    renderFilterOptions();
     renderMatches();
     if (selectedSeries) {{
       loadSeries().catch((err) => console.error(err));
