@@ -1,130 +1,94 @@
-# DeepAR M5 Setup Guide
+# DeepAR M5 Experiment & Evaluation Guide
 
-This guide matches the current code in `scripts/` and `src/deepar_m5/`.
-The workflow is local-first, with optional Weights & Biases tracking.
+This guide describes the complete end-to-end workflow for running experiments, calculating metrics aligned with competition rules, and deploying the results to the interactive viewer.
 
-## 1. Create the environment
+## 1. Run an Experiment Sweep
 
-```powershell
-conda env create -f environment.yml
-conda activate m5-deepar-scratch
-```
-
-If you already created the environment earlier, use `conda env update -f environment.yml` instead of recreating it from scratch.
-
-## 2. Smoke test
+Experiments are configured in `src/deepar_m5/experiments.py` via the `GRID_CONFIG` dictionary.
 
 ```powershell
-python scripts\smoke_deepar_m5.py --subset-size 12 --context-length 28 --prediction-length 7 --device cpu
+python scripts\run_deepar_m5_experiments.py
 ```
 
-## 3. Single training run
+**Outputs:**
+- A unique run directory under `artifacts\deepar_m5_experiments\run_YYYYMMDD_...`
+- `holdout_forecasts_*.csv`: Raw and rounded forecasts for multiple modes (mean, p50, etc.).
+- `run_config.json`: Consolidated hyperparameters (subset size, hidden dimension, layers, etc.).
+- `metrics.json`: Internal training/validation NLL history.
+
+## 2. Calculate Accurate WRMSSE Scores
+
+We use a local implementation that is mathematically aligned with the official `m5-wrmsse` package (trims leading zeros, uses correct holdout actuals).
 
 ```powershell
-python scripts\train_deepar_m5.py --subset-size 1000 --context-length 56 --prediction-length 28 --batch-size 128 --epochs 10 --steps-per-epoch 200 --device auto --eval-holdout
+python scripts\calculate_run_wrmsse.py "artifacts\deepar_m5_experiments\run_NAME"
 ```
 
-Useful flags:
+**Outputs:**
+- `series_json\wrmsse.json`: Contains WRMSSE scores for all 12 hierarchical levels across all forecast variants.
 
-- `--sales-file sales_train_validation.csv` for validation-style training.
-- `--eval-holdout` to write holdout forecasts and metrics at the end of training.
-- `--artifact-dir artifacts\my_run` to control where checkpoints and metrics are written.
+## 3. Generate JSON Artifacts for the UI
 
-Default training writes:
-
-- `best.pt`
-- `latest.pt`
-- `metrics.json`
-- `holdout_forecasts_<mode>.csv` when `--eval-holdout` is set
-- `holdout_forecasts_<mode>_rounded.csv` when `--eval-holdout` is set
-- `holdout_metrics_all_modes.json` when `--eval-holdout --eval-wrmsse` is set
-
-## 4. Experiment driver
-
-The experiment script does not accept comma-separated sweep lists. It runs the hardcoded grid in `src/deepar_m5/experiments.py`.
+Convert large CSV forecasts into per-series JSON objects to enable instant loading in the web viewer.
 
 ```powershell
-python scripts\run_deepar_m5_experiments.py --output-dir artifacts\deepar_m5_experiments --device cpu
+python scripts\ui\build_series_json_artifacts.py "artifacts\deepar_m5_experiments\run_NAME"
 ```
 
-Each run gets its own subdirectory under `output-dir`. The sweep also writes a timestamped summary file like `summary_YYYYMMDD_HHMMSS_ffffff.csv`.
+**Outputs:**
+- `series_json\series\*.json`: 30,000+ tiny JSON files.
+- `series_json\run_summary.json`: Metadata for the UI dropdowns.
 
-Per run, the following are written:
+## 4. Deploy to the Documentation (Web UI)
 
-- `best.pt`
-- `latest.pt`
-- `metrics.json`
-- `holdout_forecasts_mean.csv`
-- `holdout_forecasts_mean_rounded.csv`
-- `holdout_forecasts_sample-mean.csv`
-- `holdout_forecasts_sample-mean_rounded.csv`
-- `holdout_forecasts_p25.csv`
-- `holdout_forecasts_p25_rounded.csv`
-- `holdout_forecasts_p50.csv`
-- `holdout_forecasts_p50_rounded.csv`
-- `holdout_forecasts_p75.csv`
-- `holdout_forecasts_p75_rounded.csv`
-- `holdout_metrics_all_modes.json` when `--eval-wrmsse` is set
-- `holdout_metrics.json` as a compatibility copy when `--eval-wrmsse` is set
-
-## 5. Experiment dashboard
+This step moves the artifacts to the `docs/` folder and rebuilds the static HTML viewer.
 
 ```powershell
-streamlit run scripts\experiment_dashboard.py
+python scripts\ui\build_github_pages_bundle.py --run-dir "artifacts\deepar_m5_experiments\run_NAME"
 ```
 
-Use the sidebar to pick a summary file, a run, a series, and a forecast variant. The dashboard prefers the JSON artifacts under `series_json/` when they exist, and falls back to CSVs for older runs.
+**Outputs:**
+- `docs\run_NAME\`: Copied artifacts.
+- `docs\index.html`: Updated viewer including the new run.
 
-## 6. Build JSON artifacts for a run
+---
+
+## 5. View the UI Locally
+
+Do not open `docs\index.html` by double-clicking it from the filesystem. The viewer loads JSON files and should be served over HTTP.
+
+If you are already in the repository root, run:
 
 ```powershell
-python scripts\build_series_json_artifacts.py --summary-file artifacts\deepar_m5_experiments\summary_YYYYMMDD_HHMMSS_ffffff.csv --run-name run_YYYYMMDD_HHMMSS_ffffff_001_subset100_ctx56_h16_emb8_ep5_steps10_mean
+python -m http.server 8000 --directory docs
 ```
 
-This creates:
+Then open:
 
-- `series_json/run_summary.json`
-- `series_json/series_index.json`
-- `series_json/series/<series_id>.json`
+```text
+http://127.0.0.1:8000/index.html
+```
 
-These JSON files are what the dashboard loads for fast per-series viewing and public sharing.
-
-## 7. Evaluation mode
+If you prefer to `cd` into `docs/` first, the equivalent is:
 
 ```powershell
-python scripts\evaluate_deepar_m5.py --checkpoint artifacts\my_run\best.pt --sales-file sales_train_evaluation.csv --output-dir evaluations\test_run
+cd docs
+python -m http.server 8000
 ```
 
-This writes evaluation metrics and forecast CSV files for the checkpoint.
+Then open the same URL:
 
-## 8. Prediction mode
-
-```powershell
-python scripts\predict_deepar_m5.py --checkpoint artifacts\my_run\best.pt --output predictions\submission_v1.csv
+```text
+http://127.0.0.1:8000/index.html
 ```
 
-For quantile or sample-based forecasts:
+If port `8000` is already in use, replace it with another port such as `8080` in both the command and the browser URL.
 
-```powershell
-python scripts\predict_deepar_m5.py --checkpoint artifacts\my_run\best.pt --output predictions\submission_p90.csv --forecast-mode quantile --quantile 0.9 --num-samples 500 --sample-seed 42
-```
+---
 
-## 9. Weights & Biases
+## Directory Organization
 
-Enable W&B with the CLI flag:
-
-```powershell
-python scripts\run_deepar_m5_experiments.py --wandb
-```
-
-The script itself preconfigures the W&B project, group, tags, and mode defaults.
-
-## 10. Full argument reference
-
-The authoritative flag list is in the code:
-
-- `src/deepar_m5/train.py`
-- `src/deepar_m5/experiments.py`
-- `src/deepar_m5/infer.py`
-
-When in doubt, use `python scripts\train_deepar_m5.py --help` or the equivalent command for the script you are running.
+- `scripts/`: Core training, evaluation, and experiment drivers.
+- `scripts/ui/`: Artifact packaging, HTML report builders, and visualization tools.
+- `src/deepar_m5/`: Source code for the DeepAR model, data loading, and evaluation logic.
+- `docs/`: Deployment-ready JSON artifacts and the static HTML viewer.
