@@ -16,7 +16,7 @@ from deepar_m5.evaluation import (
     write_forecast_csv,
 )
 from deepar_m5.infer import load_checkpoint
-from deepar_m5.model import DeepAR, ModelConfig
+from deepar_m5.model import DeepAR, model_config_from_dict
 from deepar_m5.utils import choose_device, configure_logging
 
 
@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> None:
         series_ids=checkpoint["selected_series_ids"],
     )
 
-    model = DeepAR(ModelConfig(**checkpoint["model_config"])).to(device)
+    model = DeepAR(model_config_from_dict(checkpoint["model_config"])).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 

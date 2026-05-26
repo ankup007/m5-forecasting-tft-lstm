@@ -87,6 +87,64 @@ def forecast_multi_summaries(
     return results
 
 
+def forecast_selected_series(
+    model: DeepAR,
+    bundle,
+    data_config: DataConfig,
+    batch_size: int,
+    device: torch.device,
+    forecast_mode: str,
+    num_samples: int,
+    quantile: float,
+    sample_seed: int | None,
+) -> np.ndarray:
+    """Generate one selected forecast summary for evaluation scripts."""
+
+    if forecast_mode not in {"mean", "sample-mean", "quantile"}:
+        raise ValueError(f"Unknown forecast mode: {forecast_mode}")
+    if sample_seed is not None:
+        torch.manual_seed(sample_seed)
+
+    sampler = WindowSampler(bundle, data_config.context_length, data_config.prediction_length, seed=data_config.seed)
+    predictions = np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32)
+    all_indices = np.arange(bundle.num_series)
+
+    for offset in tqdm(range(0, bundle.num_series, batch_size), desc="predict", leave=False):
+        series_idx = all_indices[offset : offset + batch_size]
+        batch_np = sampler.make_inference_batch(series_idx)
+        batch = {
+            "target": torch.as_tensor(batch_np["target"], dtype=torch.float32, device=device),
+            "prior_history": torch.as_tensor(batch_np["prior_history"], dtype=torch.float32, device=device),
+            "covariates": torch.as_tensor(batch_np["covariates"], dtype=torch.float32, device=device),
+            "static_cats": torch.as_tensor(batch_np["static_cats"], dtype=torch.long, device=device),
+            "scale": torch.as_tensor(batch_np["scale"], dtype=torch.float32, device=device),
+        }
+        with torch.no_grad():
+            if forecast_mode == "mean":
+                pred = model.predict_mean(
+                    batch["target"],
+                    batch["covariates"],
+                    batch["static_cats"],
+                    batch["scale"],
+                    context_length=data_config.context_length,
+                    prior_history=batch["prior_history"],
+                )
+            else:
+                samples = model.predict_samples(
+                    batch["target"],
+                    batch["covariates"],
+                    batch["static_cats"],
+                    batch["scale"],
+                    context_length=data_config.context_length,
+                    num_samples=num_samples,
+                    prior_history=batch["prior_history"],
+                )
+                pred = samples.mean(dim=0) if forecast_mode == "sample-mean" else torch.quantile(samples, quantile, dim=0)
+        predictions[series_idx] = pred.clamp_min(0.0).cpu().numpy()
+
+    return predictions
+
+
 def load_holdout_actuals(
     data_dir: Path,
     train_sales_file: str,

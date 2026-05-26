@@ -16,7 +16,7 @@ from .evaluation import (
     load_holdout_actuals,
     write_forecast_csv,
 )
-from .model import DeepAR, ModelConfig, negative_binomial_nll
+from .model import DeepAR, ModelConfig
 from .utils import batch_to_torch, choose_device, configure_logging
 from .wandb_utils import add_wandb_args, init_wandb, wandb_finish, wandb_log, wandb_save
 
@@ -24,8 +24,15 @@ from .wandb_utils import add_wandb_args, init_wandb, wandb_finish, wandb_log, wa
 logger = logging.getLogger(__name__)
 
 
-def evaluate(model: DeepAR, sampler: WindowSampler, batch_size: int, device: torch.device) -> float:
-    """Evaluate masked validation NLL over deterministic holdout windows."""
+def evaluate(
+    model: DeepAR,
+    sampler: WindowSampler,
+    batch_size: int,
+    device: torch.device,
+    loss_name: str,
+    tweedie_power: float,
+) -> float:
+    """Evaluate the configured masked loss over deterministic holdout windows."""
 
     model.eval()
     total_loss = 0.0
@@ -33,14 +40,14 @@ def evaluate(model: DeepAR, sampler: WindowSampler, batch_size: int, device: tor
     with torch.no_grad():
         for batch_np in sampler.iter_validation_batches(batch_size):
             batch = batch_to_torch(batch_np, device)
-            mu, alpha = model(
+            mu, aux = model(
                 batch["target"],
                 batch["covariates"],
                 batch["static_cats"],
                 batch["scale"],
                 prior_history=batch.get("prior_history"),
             )
-            loss_sum = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
+            loss_sum = model.loss(batch["target"], mu, aux, batch["loss_mask"])
             weight = float(batch["loss_mask"].sum().item())
             total_loss += float(loss_sum.item()) * weight
             total_weight += weight
@@ -51,6 +58,7 @@ def save_checkpoint(
     path: Path,
     model: DeepAR,
     optimizer: torch.optim.Optimizer,
+    scheduler,
     data_config: DataConfig,
     bundle,
     epoch: int,
@@ -64,6 +72,7 @@ def save_checkpoint(
         {
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": None if scheduler is None else scheduler.state_dict(),
             "model_config": model.to_config_dict(),
             "data_config": config_to_dict(data_config),
             "encoders": bundle.encoders,
@@ -86,9 +95,11 @@ def train_epoch(
     steps_per_epoch: int,
     batch_size: int,
     grad_clip: float,
+    loss_name: str,
+    tweedie_power: float,
     wandb_run=None,
 ) -> float:
-    """Run teacher-forced training for a single epoch and return the mean NLL."""
+    """Run teacher-forced training for a single epoch and return the mean loss."""
 
     model.train()
     running_loss = 0.0
@@ -98,14 +109,14 @@ def train_epoch(
         batch_np = sampler.sample_train_batch(batch_size)
         batch = batch_to_torch(batch_np, device)
         optimizer.zero_grad(set_to_none=True)
-        mu, alpha = model(
+        mu, aux = model(
             batch["target"],
             batch["covariates"],
             batch["static_cats"],
             batch["scale"],
             prior_history=batch.get("prior_history"),
         )
-        loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
+        loss = model.loss(batch["target"], mu, aux, batch["loss_mask"])
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
@@ -115,7 +126,7 @@ def train_epoch(
         wandb_log(
             wandb_run,
             {
-                "train/batch_nll": batch_loss,
+                "train/batch_loss": batch_loss,
                 "train/grad_norm": float(grad_norm),
                 "train/epoch": epoch,
             },
@@ -147,10 +158,14 @@ def save_artifacts(
         "epochs": getattr(args, "epochs", 10),
         "steps_per_epoch": getattr(args, "steps_per_epoch", 200),
         "hidden_size": getattr(args, "hidden_size", 64),
-        "embedding_dim": getattr(args, "embedding_dim", 16),
         "num_layers": getattr(args, "num_layers", 1),
         "dropout": getattr(args, "dropout", 0.0),
         "learning_rate": getattr(args, "learning_rate", 1e-3),
+        "loss": getattr(args, "loss", "negative-binomial"),
+        "tweedie_power": getattr(args, "tweedie_power", 1.5),
+        "tweedie_dispersion": getattr(args, "tweedie_dispersion", 1.0),
+        "scheduler": getattr(args, "scheduler", "cosine"),
+        "eta_min": getattr(args, "eta_min", 0.0),
         "grad_clip": getattr(args, "grad_clip", 10.0),
         "seed": getattr(args, "seed", 42),
     }
@@ -284,10 +299,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--steps-per-epoch", type=int, default=200)
     parser.add_argument("--hidden-size", type=int, default=64)
-    parser.add_argument("--embedding-dim", type=int, default=16)
     parser.add_argument("--num-layers", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--loss", choices=["negative-binomial", "tweedie"], default="negative-binomial")
+    parser.add_argument("--tweedie-power", type=float, default=1.5)
+    parser.add_argument("--tweedie-dispersion", type=float, default=1.0)
+    parser.add_argument("--scheduler", choices=["none", "cosine"], default="cosine")
+    parser.add_argument("--eta-min", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
@@ -311,6 +330,7 @@ def generate_run_name(args: argparse.Namespace) -> str:
         f"sub{args.subset_size}_"
         f"h{args.hidden_size}_"
         f"lr{args.learning_rate}_"
+        f"loss{args.loss.replace('-', '')}_"
         f"ep{args.epochs}"
     )
 
@@ -349,9 +369,11 @@ def run_training(args: argparse.Namespace, wandb_run=None) -> tuple[DeepAR, list
         cardinalities=bundle.cardinalities,
         covariate_dim=len(bundle.covariate_columns),
         hidden_size=args.hidden_size,
-        embedding_dim=args.embedding_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        distribution=args.loss,
+        tweedie_power=args.tweedie_power,
+        tweedie_dispersion=args.tweedie_dispersion,
     )).to(device)
 
     if wandb_run is not None:
@@ -364,6 +386,13 @@ def run_training(args: argparse.Namespace, wandb_run=None) -> tuple[DeepAR, list
 
     save_artifacts(artifact_dir, bundle, data_config, model, args)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    scheduler = None
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs),
+            eta_min=args.eta_min,
+        )
     
     best_val_loss = float("inf")
     best_state = None
@@ -373,21 +402,39 @@ def run_training(args: argparse.Namespace, wandb_run=None) -> tuple[DeepAR, list
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
             model, sampler, optimizer, device, epoch,
-            args.steps_per_epoch, args.batch_size, args.grad_clip, wandb_run
+            args.steps_per_epoch, args.batch_size, args.grad_clip,
+            args.loss, args.tweedie_power, wandb_run
         )
-        val_loss = evaluate(model, sampler, args.batch_size, device)
+        val_loss = evaluate(model, sampler, args.batch_size, device, args.loss, args.tweedie_power)
+        if scheduler is not None:
+            scheduler.step()
         
-        logger.info("epoch=%s train_nll=%.5f val_nll=%.5f", epoch, train_loss, val_loss)
-        wandb_log(wandb_run, {"train/epoch_nll": train_loss, "validation/nll": val_loss, "train/epoch": epoch}, 
-                    step=epoch * args.steps_per_epoch)
+        current_lr = optimizer.param_groups[0]["lr"]
+        logger.info(
+            "epoch=%s train_loss=%.5f val_loss=%.5f lr=%.8f loss=%s",
+            epoch,
+            train_loss,
+            val_loss,
+            current_lr,
+            args.loss,
+        )
+        wandb_payload = {
+            "train/epoch_loss": train_loss,
+            "validation/loss": val_loss,
+            "train/epoch": epoch,
+            "train/lr": current_lr,
+        }
+        if args.loss == "negative-binomial":
+            wandb_payload.update({"train/epoch_nll": train_loss, "validation/nll": val_loss})
+        wandb_log(wandb_run, wandb_payload, step=epoch * args.steps_per_epoch)
 
         metrics_history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        save_checkpoint(artifact_dir / "latest.pt", model, optimizer, data_config, bundle, epoch, best_val_loss, args)
+        save_checkpoint(artifact_dir / "latest.pt", model, optimizer, scheduler, data_config, bundle, epoch, best_val_loss, args)
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            save_checkpoint(artifact_dir / "best.pt", model, optimizer, data_config, bundle, epoch, best_val_loss, args)
+            save_checkpoint(artifact_dir / "best.pt", model, optimizer, scheduler, data_config, bundle, epoch, best_val_loss, args)
 
         (artifact_dir / "metrics.json").write_text(json.dumps(metrics_history, indent=2), encoding="utf-8")
         wandb_save(wandb_run, artifact_dir / "metrics.json")

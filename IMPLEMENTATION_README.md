@@ -20,7 +20,7 @@ The real implementation lives in `src/deepar_m5/`:
 | File | What it owns |
 |---|---|
 | `data.py` | M5 CSV loading, static encoders, covariate construction, scaling, sampled windows. |
-| `model.py` | Custom LSTM cell, DeepAR network, autoregressive prediction, negative-binomial loss. |
+| `model.py` | Custom LSTM cell, DeepAR network, autoregressive prediction, Negative Binomial and Tweedie losses. |
 | `train.py` | Training loop, validation loop, checkpoint/config/artifact writing. |
 | `infer.py` | Checkpoint loading, future decoding, fallback forecasts, submission formatting. |
 | `smoke.py` | End-to-end shape/loss/backprop/inference sanity test. |
@@ -42,7 +42,7 @@ Training follows this path:
 4. Calendar, SNAP, and price covariates are built into a `(series, day, feature)` array.
 5. `WindowSampler` samples rolling windows without materializing every possible window.
 6. `DeepAR.forward` uses teacher forcing: each step receives the actual previous target.
-7. `negative_binomial_nll` computes the masked loss only over the prediction part of each window.
+7. The configured forecast loss computes the masked loss only over the prediction part of each window.
 8. Checkpoints and metadata are written to `artifacts/deepar_m5/`.
 
 Inference follows this path:
@@ -70,7 +70,8 @@ Implemented directly:
 - Static categorical embeddings for M5 item/store metadata.
 - A custom LSTM cell using raw PyTorch matrix operations.
 - Global DeepAR-style recurrent model shared across all selected series.
-- Negative-binomial distribution parameters and log likelihood.
+- Distribution-specific forecast heads for Negative Binomial and Tweedie.
+- Negative Binomial NLL, Tweedie deviance loss, and distribution-specific sampling.
 - Rolling-window sampler for train and validation.
 - Teacher-forced training and autoregressive inference.
 - Checkpoint, config, encoder, metrics, and submission artifact handling.
@@ -91,9 +92,12 @@ Start with data and training-budget knobs before increasing model size.
 | `--steps-per-epoch` | `200` | Controls how many sampled windows the model sees per epoch. Increase before over-tuning architecture. |
 | `--epochs` | `10` | Increase once validation loss keeps improving. |
 | `--hidden-size` | `64` | Main model capacity knob. Try `32`, `64`, `96`, `128`. |
-| `--embedding-dim` | `16` | Capacity for static categories. Try `8` or `16` first. |
 | `--num-layers` | `1` | Add a second layer only after the single-layer model is clearly underfitting. |
 | `--learning-rate` | `1e-3` | Lower to `3e-4` if training is unstable. |
+| `--loss` | `negative-binomial` | Use `tweedie` to test the intermittent-demand loss from the M5 NN approach while keeping the rest of the pipeline fixed. |
+| `--scheduler` | `cosine` | Use `none` for exact no-scheduler comparisons. |
+| `--tweedie-power` | `1.5` | Tune only for Tweedie runs; must stay between `1` and `2`. |
+| `--tweedie-dispersion` | `1.0` | Fixed Tweedie dispersion used for loss scaling and compound Poisson-Gamma sampling variance. |
 
 Recommended scaling path:
 

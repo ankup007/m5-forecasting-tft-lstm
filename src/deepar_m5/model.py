@@ -9,6 +9,17 @@ from torch.nn import functional as F
 logger = logging.getLogger(__name__)
 
 
+def normalize_distribution(distribution: str) -> str:
+    """Normalize user-facing distribution aliases."""
+
+    normalized = distribution.lower().replace("_", "-")
+    if normalized in {"negative-binomial", "nb"}:
+        return "negative-binomial"
+    if normalized == "tweedie":
+        return "tweedie"
+    raise ValueError(f"Unknown distribution: {distribution}")
+
+
 @dataclass
 class ModelConfig:
     """Shape and capacity settings needed to construct a DeepAR model."""
@@ -16,9 +27,11 @@ class ModelConfig:
     cardinalities: list[int]
     covariate_dim: int
     hidden_size: int = 64
-    embedding_dim: int = 16
     num_layers: int = 1
     dropout: float = 0.0
+    distribution: str = "negative-binomial"
+    tweedie_power: float = 1.5
+    tweedie_dispersion: float = 1.0
 
 
 class ScratchLSTMCell(nn.Module):
@@ -69,8 +82,10 @@ class DeepAR(nn.Module):
 
         super().__init__()
         self.config = config
-        #  a helper function for the fast.ai heuristic
+
         def get_emb_dim(cardinality: int) -> int:
+            """Use the fast.ai categorical embedding size heuristic."""
+
             return min(50, (cardinality + 1) // 2)
         
         self.embeddings = nn.ModuleList(
@@ -91,7 +106,9 @@ class DeepAR(nn.Module):
             )
         self.cells = nn.ModuleList(cells)
         self.dropout = nn.Dropout(config.dropout)
-        self.output = nn.Linear(config.hidden_size, 2)
+        self.distribution = normalize_distribution(config.distribution)
+        output_dim = 2 if self.distribution == "negative-binomial" else 1
+        self.output = nn.Linear(config.hidden_size, output_dim)
 
     def static_embedding(self, static_cats: torch.Tensor) -> torch.Tensor:
         """Embed and concatenate all static categorical identifiers."""
@@ -118,8 +135,8 @@ class DeepAR(nn.Module):
         static_emb: torch.Tensor,
         log_scale: torch.Tensor,
         states: list[tuple[torch.Tensor, torch.Tensor]],
-    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Run one autoregressive step and produce negative-binomial parameters."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Run one autoregressive step and produce distribution parameters."""
 
         # target_history shape: [batch, 28] (or whatever buffer size we chose)
         # We need lag_7 and rolling_mean_7 (last 7 days)
@@ -138,7 +155,7 @@ class DeepAR(nn.Module):
 
         raw = self.output(x)
         mu_scaled = F.softplus(raw[:, :1]) + 1e-4
-        alpha = F.softplus(raw[:, 1:2]) + 1e-4
+        alpha = F.softplus(raw[:, 1:2]) + 1e-4 if self.distribution == "negative-binomial" else None
         return mu_scaled, alpha, next_states
 
     def forward(
@@ -148,7 +165,7 @@ class DeepAR(nn.Module):
         static_cats: torch.Tensor,
         scale: torch.Tensor,
         prior_history: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run teacher-forced training over a full context-plus-horizon window."""
 
         batch_size, seq_len = target.shape
@@ -175,16 +192,15 @@ class DeepAR(nn.Module):
                 log_scale,
                 states,
             )
-            logger.info(f"forward: mu shape : {mu_scaled.shape}")
-            logger.info(f"forward: alpha shape : {alpha.shape}")
             mus.append(mu_scaled * scale)
-            alphas.append(alpha)
+            if alpha is not None:
+                alphas.append(alpha)
             
             # Update history with ground truth (teacher forcing)
             next_target_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
             history = torch.cat([history[:, 1:], next_target_scaled], dim=1)
 
-        return torch.cat(mus, dim=1), torch.cat(alphas, dim=1)
+        return torch.cat(mus, dim=1), torch.cat(alphas, dim=1) if alphas else None
 
     @torch.no_grad()
     def predict_mean(
@@ -219,7 +235,6 @@ class DeepAR(nn.Module):
                 log_scale,
                 states,
             )
-            logger.info(f"predict mean: mu shape : {mu_scaled.shape}")
             mu = mu_scaled * scale
             
             if step >= context_length:
@@ -274,7 +289,6 @@ class DeepAR(nn.Module):
                 log_scale,
                 states,
             )
-            logger.info(f"predict samples step < context - mu shape : {mu_scaled.shape}")
             next_target_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
             history = torch.cat([history[:, 1:], next_target_scaled], dim=1)
 
@@ -309,9 +323,8 @@ class DeepAR(nn.Module):
                 log_scale,
                 states,
             )
-            logger.info(f"predict samples step > context - mu shape : {mu_scaled.shape}")
             mu = mu_scaled * repeated_scale
-            sample = sample_negative_binomial(mu, alpha)
+            sample = self.sample(mu, alpha)
             samples.append(sample)
             
             # Update history with prediction (sample)
@@ -320,6 +333,40 @@ class DeepAR(nn.Module):
 
         stacked = torch.cat(samples, dim=1)
         return stacked.view(batch_size, num_samples, -1).transpose(0, 1).contiguous()
+
+    def loss(
+        self,
+        target: torch.Tensor,
+        mu: torch.Tensor,
+        aux: torch.Tensor | None,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute the configured masked distribution loss."""
+
+        if self.distribution == "negative-binomial":
+            if aux is None:
+                raise ValueError("Negative Binomial loss requires alpha.")
+            return negative_binomial_nll(target, mu, aux, mask)
+        return tweedie_deviance_loss(
+            target,
+            mu,
+            power=self.config.tweedie_power,
+            dispersion=self.config.tweedie_dispersion,
+            mask=mask,
+        )
+
+    def sample(self, mu: torch.Tensor, aux: torch.Tensor | None) -> torch.Tensor:
+        """Sample from the configured predictive distribution."""
+
+        if self.distribution == "negative-binomial":
+            if aux is None:
+                raise ValueError("Negative Binomial sampling requires alpha.")
+            return sample_negative_binomial(mu, aux)
+        return sample_tweedie(
+            mu,
+            power=self.config.tweedie_power,
+            dispersion=self.config.tweedie_dispersion,
+        )
 
     def to_config_dict(self) -> dict:
         """Return the serializable model configuration saved in checkpoints."""
@@ -356,6 +403,76 @@ def negative_binomial_nll(
     return (loss * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def tweedie_deviance_loss(
+    target: torch.Tensor,
+    mu: torch.Tensor,
+    power: float = 1.5,
+    dispersion: float = 1.0,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute masked Tweedie deviance loss up to target-only constants.
+
+    For ``1 < power < 2``, the Tweedie family models non-negative continuous
+    values with a point mass at zero, which is a useful proxy for intermittent
+    retail demand. The omitted terms do not depend on the prediction; fixed
+    dispersion only scales the objective and controls sampling variance.
+    """
+
+    if not 1.0 < power < 2.0:
+        raise ValueError("Tweedie power must be strictly between 1 and 2.")
+    if dispersion <= 0.0:
+        raise ValueError("Tweedie dispersion must be positive.")
+
+    target = target.clamp_min(0.0)
+    mu = mu.clamp_min(1e-6)
+    loss = ((mu.pow(2.0 - power) / (2.0 - power)) - (
+        target * mu.pow(1.0 - power) / (1.0 - power)
+    )) / dispersion
+    if mask is None:
+        return loss.mean()
+    return (loss * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def tweedie_nll(
+    target: torch.Tensor,
+    mu: torch.Tensor,
+    power: float = 1.5,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Backward-compatible alias for the fixed-dispersion Tweedie deviance."""
+
+    return tweedie_deviance_loss(target, mu, power=power, mask=mask)
+
+
+def masked_forecast_loss(
+    loss_name: str,
+    target: torch.Tensor,
+    mu: torch.Tensor,
+    alpha: torch.Tensor | None,
+    mask: torch.Tensor | None = None,
+    tweedie_power: float = 1.5,
+    tweedie_dispersion: float = 1.0,
+) -> torch.Tensor:
+    """Dispatch a masked forecast loss without requiring a model instance."""
+
+    normalized = normalize_distribution(loss_name)
+    if normalized == "negative-binomial":
+        if alpha is None:
+            raise ValueError("Negative Binomial loss requires alpha.")
+        return negative_binomial_nll(target, mu, alpha, mask)
+    return tweedie_deviance_loss(target, mu, power=tweedie_power, dispersion=tweedie_dispersion, mask=mask)
+
+
+def model_config_from_dict(payload: dict) -> ModelConfig:
+    """Create ``ModelConfig`` while ignoring stale checkpoint-only keys."""
+
+    valid_keys = set(ModelConfig.__dataclass_fields__)
+    filtered = {key: value for key, value in payload.items() if key in valid_keys}
+    if "loss" in payload and "distribution" not in filtered:
+        filtered["distribution"] = payload["loss"]
+    return ModelConfig(**filtered)
+
+
 def sample_negative_binomial(mu: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     """Sample counts from the same Negative Binomial parameterization used by the loss."""
 
@@ -364,3 +481,24 @@ def sample_negative_binomial(mu: torch.Tensor, alpha: torch.Tensor) -> torch.Ten
     probs = (mu / (mu + alpha)).clamp(1e-6, 1.0 - 1e-6)
     distribution = torch.distributions.NegativeBinomial(total_count=alpha, probs=probs)
     return distribution.sample()
+
+
+def sample_tweedie(mu: torch.Tensor, power: float = 1.5, dispersion: float = 1.0) -> torch.Tensor:
+    """Sample Tweedie values using the compound Poisson-Gamma representation."""
+
+    if not 1.0 < power < 2.0:
+        raise ValueError("Tweedie power must be strictly between 1 and 2.")
+    if dispersion <= 0.0:
+        raise ValueError("Tweedie dispersion must be positive.")
+
+    mu = mu.clamp_min(1e-6)
+    poisson_rate = (mu.pow(2.0 - power) / (dispersion * (2.0 - power))).clamp_max(1e6)
+    poisson_counts = torch.poisson(poisson_rate)
+    gamma_shape = (2.0 - power) / (power - 1.0)
+    gamma_scale = dispersion * (power - 1.0) * mu.pow(power - 1.0)
+    gamma = torch.distributions.Gamma(
+        concentration=(poisson_counts * gamma_shape).clamp_min(1e-6),
+        rate=(1.0 / gamma_scale).clamp_min(1e-6),
+    )
+    sample = gamma.sample()
+    return torch.where(poisson_counts > 0.0, sample, torch.zeros_like(sample))

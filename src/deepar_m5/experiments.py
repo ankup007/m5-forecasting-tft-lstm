@@ -25,7 +25,7 @@ def run_name(index: int, params: dict[str, int | float | str]) -> str:
         f"subset{params['subset_size']}",
         f"ctx{params['context_length']}",
         f"h{params['hidden_size']}",
-        f"emb{params['embedding_dim']}",
+        f"loss{str(params.get('loss', 'negative-binomial')).replace('-', '')}",
         f"ep{params['epochs']}",
         f"steps{params['steps_per_epoch']}",
     ]
@@ -37,7 +37,19 @@ def run_name(index: int, params: dict[str, int | float | str]) -> str:
     return "_".join(pieces)
 
 
-# Define your hyperparameter grid here for sweeps
+# Define your hyperparameter grid here for sweeps.
+# Each key maps to a list of values; experiment_grid() runs the Cartesian
+# product of all lists, so adding two values doubles the number of runs.
+#
+# Distribution/scheduler options:
+# - loss: "negative-binomial" or "tweedie".
+# - scheduler: "cosine" or "none".
+# - eta_min: final LR for cosine annealing; 0.0 is standard, 1e-5 can avoid a fully zero LR.
+# - tweedie_power: only used when loss="tweedie"; must be 1 < p < 2.
+#   Practical M5 range: [1.1, 1.3, 1.5, 1.7]. Start with 1.5.
+# - tweedie_dispersion: only used when loss="tweedie"; must be > 0.
+#   It scales Tweedie loss and controls sampling variance. Start with 1.0;
+#   try [0.5, 1.0, 2.0] if Tweedie is competitive.
 GRID_CONFIG = {
     "subset_size": [34590],
     "context_length": [84],
@@ -45,24 +57,56 @@ GRID_CONFIG = {
     "epochs": [20],
     "steps_per_epoch": [100],
     "hidden_size": [64],
-    "embedding_dim": [8],
     "num_layers": [2],
     "dropout": [0.1],
     "learning_rate": [0.001],
+    "loss": ["negative-binomial"],
+    "scheduler": ["cosine"],
+    "eta_min": [0.0],
+    "tweedie_power": [1.5],
+    "tweedie_dispersion": [1.0],
     "seed": [42],
 }
 
 def experiment_grid() -> list[dict[str, int | float | str]]:
-    """Generate experiment configurations from the hardcoded GRID_CONFIG."""
+    """Generate experiment configurations from the hardcoded GRID_CONFIG.
 
-    keys = list(GRID_CONFIG.keys())
-    values = list(GRID_CONFIG.values())
+    Tweedie-only knobs are expanded only when ``loss == "tweedie"``. For
+    other losses, the first configured Tweedie values are carried through as
+    fixed metadata so the resulting run config remains complete, but they do
+    not multiply the grid.
+    """
+
+    shared_keys = [key for key in GRID_CONFIG if key not in {"loss", "tweedie_power", "tweedie_dispersion"}]
+    shared_values = [GRID_CONFIG[key] for key in shared_keys]
+    losses = GRID_CONFIG["loss"]
+    tweedie_powers = GRID_CONFIG["tweedie_power"]
+    tweedie_dispersions = GRID_CONFIG["tweedie_dispersion"]
+    default_tweedie_power = tweedie_powers[0]
+    default_tweedie_dispersion = tweedie_dispersions[0]
+
     grid = []
-    
-    for combination in itertools.product(*values):
-        params = dict(zip(keys, combination))
-        grid.append(params)
-        
+    for shared_combination in itertools.product(*shared_values):
+        shared_params = dict(zip(shared_keys, shared_combination))
+        for loss in losses:
+            if loss == "tweedie":
+                for power, dispersion in itertools.product(tweedie_powers, tweedie_dispersions):
+                    params = {
+                        **shared_params,
+                        "loss": loss,
+                        "tweedie_power": power,
+                        "tweedie_dispersion": dispersion,
+                    }
+                    grid.append(params)
+            else:
+                params = {
+                    **shared_params,
+                    "loss": loss,
+                    "tweedie_power": default_tweedie_power,
+                    "tweedie_dispersion": default_tweedie_dispersion,
+                }
+                grid.append(params)
+
     return grid
 
 

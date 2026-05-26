@@ -10,7 +10,7 @@ import torch
 from tqdm import tqdm
 
 from .data import DataConfig, WindowSampler, find_day_columns, load_m5_bundle
-from .model import DeepAR, ModelConfig
+from .model import DeepAR, model_config_from_dict
 from .utils import batch_to_torch, choose_device, configure_logging
 
 
@@ -111,7 +111,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     sampler = WindowSampler(bundle, data_config.context_length, data_config.prediction_length, seed=data_config.seed)
 
-    model = DeepAR(ModelConfig(**checkpoint["model_config"])).to(device)
+    model = DeepAR(model_config_from_dict(checkpoint["model_config"])).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> None:
                     batch["static_cats"],
                     batch["scale"],
                     context_length=data_config.context_length,
-                    prior_target=batch.get("prior_target"),
+                    prior_history=batch.get("prior_history"),
                 )
             else:
                 samples = model.predict_samples(
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> None:
                     batch["scale"],
                     context_length=data_config.context_length,
                     num_samples=args.num_samples,
-                    prior_target=batch.get("prior_target"),
+                    prior_history=batch.get("prior_history"),
                 )
                 if args.forecast_mode == "sample-mean":
                     pred = samples.mean(dim=0)

@@ -33,6 +33,8 @@ def batch_to_torch(batch: dict[str, np.ndarray], device: torch.device) -> dict[s
         "scale": torch.as_tensor(batch["scale"], dtype=torch.float32, device=device),
         "loss_mask": torch.as_tensor(batch.get("loss_mask", batch["target"]), dtype=torch.float32, device=device),
     }
+    if "prior_history" in batch:
+        torch_batch["prior_history"] = torch.as_tensor(batch["prior_history"], dtype=torch.float32, device=device)
     if "prior_target" in batch:
         torch_batch["prior_target"] = torch.as_tensor(batch["prior_target"], dtype=torch.float32, device=device)
     

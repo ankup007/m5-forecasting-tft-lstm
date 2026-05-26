@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from .data import DataConfig, WindowSampler, load_m5_bundle
-from .model import DeepAR, ModelConfig, negative_binomial_nll
+from .model import DeepAR, ModelConfig
 from .train import batch_to_torch, choose_device, configure_logging
 
 
@@ -24,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--context-length", type=int, default=28)
     parser.add_argument("--prediction-length", type=int, default=7)
+    parser.add_argument("--loss", choices=["negative-binomial", "tweedie"], default="negative-binomial")
+    parser.add_argument("--tweedie-power", type=float, default=1.5)
+    parser.add_argument("--tweedie-dispersion", type=float, default=1.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -55,22 +58,28 @@ def main(argv: list[str] | None = None) -> None:
             cardinalities=bundle.cardinalities,
             covariate_dim=len(bundle.covariate_columns),
             hidden_size=16,
-            embedding_dim=4,
+            distribution=args.loss,
+            tweedie_power=args.tweedie_power,
+            tweedie_dispersion=args.tweedie_dispersion,
         )
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     batch = batch_to_torch(sampler.sample_train_batch(args.batch_size), device)
-    mu, alpha = model(
+    mu, aux = model(
         batch["target"],
         batch["covariates"],
         batch["static_cats"],
         batch["scale"],
         prior_history=batch.get("prior_history"),
     )
-    loss = negative_binomial_nll(batch["target"], mu, alpha, batch["loss_mask"])
+    loss = model.loss(batch["target"], mu, aux, batch["loss_mask"])
     assert torch.isfinite(loss), "loss is not finite"
     assert mu.shape == batch["target"].shape
-    assert alpha.shape == batch["target"].shape
+    if args.loss == "negative-binomial":
+        assert aux is not None
+        assert aux.shape == batch["target"].shape
+    else:
+        assert aux is None
     loss.backward()
     optimizer.step()
 
