@@ -51,19 +51,19 @@ def run_name(index: int, params: dict[str, int | float | str]) -> str:
 #   It scales Tweedie loss and controls sampling variance. Start with 1.0;
 #   try [0.5, 1.0, 2.0] if Tweedie is competitive.
 GRID_CONFIG = {
-    "subset_size": [34590],
-    "context_length": [84],
-    "batch_size": [1024],
-    "epochs": [20],
-    "steps_per_epoch": [100],
+    "subset_size": [30490],
+    "context_length": [112],
+    "batch_size": [512],
+    "epochs": [100],
+    "steps_per_epoch": [60],
     "hidden_size": [64],
     "num_layers": [2],
     "dropout": [0.1],
     "learning_rate": [0.001],
-    "loss": ["negative-binomial"],
-    "scheduler": ["cosine"],
-    "eta_min": [0.0],
-    "tweedie_power": [1.5],
+    "loss": ["tweedie", "negative-binomial"],
+    "scheduler": ["cosine", None],
+    "eta_min": [0.00001],
+    "tweedie_power": [1.5, 1.7],
     "tweedie_dispersion": [1.0],
     "seed": [42],
 }

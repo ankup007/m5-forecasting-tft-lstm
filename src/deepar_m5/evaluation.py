@@ -37,9 +37,9 @@ def forecast_multi_summaries(
     results = {
         "mean": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
         "sample-mean": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
-        "p25": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
-        "p50": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
-        "p75": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
+        # "p25": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
+        # "p50": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
+        # "p75": np.zeros((bundle.num_series, data_config.prediction_length), dtype=np.float32),
     }
     
     all_indices = np.arange(bundle.num_series)
@@ -80,9 +80,9 @@ def forecast_multi_summaries(
             
             # 3. Derive stochastic summaries from the same samples
             results["sample-mean"][series_idx] = samples.mean(dim=0).cpu().numpy()
-            results["p25"][series_idx] = torch.quantile(samples, 0.25, dim=0).cpu().numpy()
-            results["p50"][series_idx] = torch.quantile(samples, 0.50, dim=0).cpu().numpy()
-            results["p75"][series_idx] = torch.quantile(samples, 0.75, dim=0).cpu().numpy()
+            # results["p25"][series_idx] = torch.quantile(samples, 0.25, dim=0).cpu().numpy()
+            # results["p50"][series_idx] = torch.quantile(samples, 0.50, dim=0).cpu().numpy()
+            # results["p75"][series_idx] = torch.quantile(samples, 0.75, dim=0).cpu().numpy()
             
     return results
 
