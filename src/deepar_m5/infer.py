@@ -107,6 +107,7 @@ def main(argv: list[str] | None = None) -> None:
     bundle = load_m5_bundle(
         data_config,
         encoders=checkpoint["encoders"],
+        event_encoders=checkpoint.get("event_encoders"),
         series_ids=checkpoint["selected_series_ids"],
     )
     sampler = WindowSampler(bundle, data_config.context_length, data_config.prediction_length, seed=data_config.seed)
@@ -136,6 +137,7 @@ def main(argv: list[str] | None = None) -> None:
                     batch["scale"],
                     context_length=data_config.context_length,
                     prior_history=batch.get("prior_history"),
+                    initial_zero_counter=batch.get("initial_zero_counter"),
                 )
             else:
                 samples = model.predict_samples(
@@ -146,6 +148,7 @@ def main(argv: list[str] | None = None) -> None:
                     context_length=data_config.context_length,
                     num_samples=args.num_samples,
                     prior_history=batch.get("prior_history"),
+                    initial_zero_counter=batch.get("initial_zero_counter"),
                 )
                 if args.forecast_mode == "sample-mean":
                     pred = samples.mean(dim=0)

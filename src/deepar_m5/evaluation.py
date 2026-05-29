@@ -49,6 +49,7 @@ def forecast_multi_summaries(
         batch = {
             "target": torch.as_tensor(batch_to_move["target"], dtype=torch.float32, device=device),
             "prior_history": torch.as_tensor(batch_to_move["prior_history"], dtype=torch.float32, device=device),
+            "initial_zero_counter": torch.as_tensor(batch_to_move["initial_zero_counter"], dtype=torch.float32, device=device),
             "covariates": torch.as_tensor(batch_to_move["covariates"], dtype=torch.float32, device=device),
             "static_cats": torch.as_tensor(batch_to_move["static_cats"], dtype=torch.long, device=device),
             "scale": torch.as_tensor(batch_to_move["scale"], dtype=torch.float32, device=device),
@@ -63,6 +64,7 @@ def forecast_multi_summaries(
                 batch["scale"],
                 context_length=data_config.context_length,
                 prior_history=batch["prior_history"],
+                initial_zero_counter=batch["initial_zero_counter"],
             )
             results["mean"][series_idx] = pred_mean.clamp_min(0.0).cpu().numpy()
             
@@ -75,6 +77,7 @@ def forecast_multi_summaries(
                 context_length=data_config.context_length,
                 num_samples=num_samples,
                 prior_history=batch["prior_history"],
+                initial_zero_counter=batch["initial_zero_counter"],
             )
             samples = samples.clamp_min(0.0)
             
@@ -115,6 +118,7 @@ def forecast_selected_series(
         batch = {
             "target": torch.as_tensor(batch_np["target"], dtype=torch.float32, device=device),
             "prior_history": torch.as_tensor(batch_np["prior_history"], dtype=torch.float32, device=device),
+            "initial_zero_counter": torch.as_tensor(batch_np["initial_zero_counter"], dtype=torch.float32, device=device),
             "covariates": torch.as_tensor(batch_np["covariates"], dtype=torch.float32, device=device),
             "static_cats": torch.as_tensor(batch_np["static_cats"], dtype=torch.long, device=device),
             "scale": torch.as_tensor(batch_np["scale"], dtype=torch.float32, device=device),
@@ -128,6 +132,7 @@ def forecast_selected_series(
                     batch["scale"],
                     context_length=data_config.context_length,
                     prior_history=batch["prior_history"],
+                    initial_zero_counter=batch["initial_zero_counter"],
                 )
             else:
                 samples = model.predict_samples(
@@ -138,6 +143,7 @@ def forecast_selected_series(
                     context_length=data_config.context_length,
                     num_samples=num_samples,
                     prior_history=batch["prior_history"],
+                    initial_zero_counter=batch["initial_zero_counter"],
                 )
                 pred = samples.mean(dim=0) if forecast_mode == "sample-mean" else torch.quantile(samples, quantile, dim=0)
         predictions[series_idx] = pred.clamp_min(0.0).cpu().numpy()

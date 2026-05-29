@@ -37,6 +37,8 @@ def batch_to_torch(batch: dict[str, np.ndarray], device: torch.device) -> dict[s
         torch_batch["prior_history"] = torch.as_tensor(batch["prior_history"], dtype=torch.float32, device=device)
     if "prior_target" in batch:
         torch_batch["prior_target"] = torch.as_tensor(batch["prior_target"], dtype=torch.float32, device=device)
+    if "initial_zero_counter" in batch:
+        torch_batch["initial_zero_counter"] = torch.as_tensor(batch["initial_zero_counter"], dtype=torch.float32, device=device)
     
     return torch_batch
 

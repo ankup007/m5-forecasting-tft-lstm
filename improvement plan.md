@@ -7,9 +7,6 @@ This document tracks implementation work inspired by the M5 3rd-place neural-net
 - [x] Studied the 3rd-place M5 NN approach and mapped it to this repo.
 - [x] Identified the main gaps: Tweedie loss, rolled/sampled training, rolling WRMSSE validation, richer features, and ensembling.
 - [x] Decided the first experiment should isolate loss/scheduler changes instead of changing features or validation at the same time.
-
-## Current Batch
-
 - [x] Fix history wiring so `prior_history` reaches training, validation, smoke tests, and standalone inference.
 - [x] Remove unused `embedding_dim` from active model/training configuration.
 - [x] Add `--loss negative-binomial|tweedie`, defaulting to `negative-binomial`.
@@ -17,33 +14,23 @@ This document tracks implementation work inspired by the M5 3rd-place neural-net
 - [x] Separate Negative Binomial and Tweedie output heads so Tweedie no longer emits unused `alpha`.
 - [x] Add Tweedie compound Poisson-Gamma sampling for sampled forecasts and quantiles.
 - [x] Add `--scheduler none|cosine`, defaulting to cosine annealing.
-- [ ] Run controlled baseline and Tweedie experiments with the same seed/config.
+- [x] **Feature Engineering Expansion**:
+    - [x] Implemented scale-aware dynamic zero-counter with 0.5 unit threshold.
+    - [x] Implemented rolling 7 and 28-day means calculated on-the-fly.
+    - [x] Added advanced price ratios (relative to historical max and daily department mean).
+    - [x] Implemented normalized cyclic and linear time features (wday, month, year, week, day).
+    - [x] Switched event handling to dedicated categorical embeddings for `event_name` and `event_type`.
+- [x] Verified all features and model changes with a successful end-to-end smoke test.
+
+## Current Batch (Experimentation)
+
+- [ ] Run controlled baseline (Negative Binomial) and Tweedie experiments with the same seed/config.
 - [ ] Compare validation loss and holdout metrics/WRMSSE where available.
+- [ ] Document results in a new architectural comparison or performance log.
 
-## Experiment Commands
+## Next Steps (Architecture & Tuning)
 
-Baseline with the existing loss:
-
-```powershell
-python scripts\train_deepar_m5.py --loss negative-binomial --scheduler cosine --subset-size 34590 --context-length 84 --batch-size 1024 --epochs 20 --steps-per-epoch 100 --hidden-size 64 --num-layers 2 --dropout 0.1 --learning-rate 0.001 --seed 42 --eval-holdout --eval-wrmsse
-```
-
-Tweedie test with the same setup:
-
-```powershell
-python scripts\train_deepar_m5.py --loss tweedie --tweedie-power 1.5 --tweedie-dispersion 1.0 --scheduler cosine --subset-size 34590 --context-length 84 --batch-size 1024 --epochs 20 --steps-per-epoch 100 --hidden-size 64 --num-layers 2 --dropout 0.1 --learning-rate 0.001 --seed 42 --eval-holdout --eval-wrmsse
-```
-
-For quick validation before full runs:
-
-```powershell
-python scripts\train_deepar_m5.py --loss tweedie --scheduler cosine --subset-size 64 --context-length 28 --prediction-length 7 --batch-size 8 --epochs 1 --steps-per-epoch 2 --hidden-size 16 --device cpu --log-level INFO
-```
-
-## Later
-
-- [ ] Implement rolled/sampled training so horizon inputs can use sampled model outputs instead of pure teacher forcing.
-- [ ] Add rolling validation over multiple 28-day windows and select by average WRMSSE instead of single-window likelihood.
-- [ ] Expand feature engineering with zero-sales/staleness features, richer lag/rolling statistics, price-relative features, and event identity/distance features.
+- [ ] Implement **rolled/sampled training**: Modify the training loop so that during the horizon, the model occasionally sees its own previous samples/means instead of 100% teacher forcing.
+- [ ] Add **rolling validation** over multiple 28-day windows to better approximate competition leaderboard stability.
 - [ ] Add seed/checkpoint ensembling and forecast averaging.
-- [ ] Tune Tweedie power and dispersion if initial Tweedie results are competitive.
+- [ ] Tune Tweedie power and dispersion based on initial experiment results.

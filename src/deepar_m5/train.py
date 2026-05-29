@@ -46,6 +46,7 @@ def evaluate(
                 batch["static_cats"],
                 batch["scale"],
                 prior_history=batch.get("prior_history"),
+                initial_zero_counter=batch.get("initial_zero_counter"),
             )
             loss_sum = model.loss(batch["target"], mu, aux, batch["loss_mask"])
             weight = float(batch["loss_mask"].sum().item())
@@ -76,6 +77,7 @@ def save_checkpoint(
             "model_config": model.to_config_dict(),
             "data_config": config_to_dict(data_config),
             "encoders": bundle.encoders,
+            "event_encoders": bundle.event_encoders,
             "covariate_columns": bundle.covariate_columns,
             "selected_series_ids": bundle.sales_frame["id"].astype(str).tolist(),
             "epoch": epoch,
@@ -115,6 +117,7 @@ def train_epoch(
             batch["static_cats"],
             batch["scale"],
             prior_history=batch.get("prior_history"),
+            initial_zero_counter=batch.get("initial_zero_counter"),
         )
         loss = model.loss(batch["target"], mu, aux, batch["loss_mask"])
         loss.backward()
@@ -365,9 +368,16 @@ def run_training(args: argparse.Namespace, wandb_run=None) -> tuple[DeepAR, list
     sampler = WindowSampler(bundle, args.context_length, args.prediction_length, seed=args.seed)
     device = choose_device(args.device)
 
+    # In the updated feature set:
+    # event_cardinalities come from bundle.event_cardinalities
+    # continuous_covariate_dim = total_covariates - num_events
+    num_events = len(bundle.event_cardinalities)
+    continuous_covariate_dim = len(bundle.covariate_columns) - num_events
+
     model = DeepAR(ModelConfig(
         cardinalities=bundle.cardinalities,
-        covariate_dim=len(bundle.covariate_columns),
+        event_cardinalities=bundle.event_cardinalities,
+        covariate_dim=continuous_covariate_dim,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         dropout=args.dropout,

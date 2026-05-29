@@ -25,6 +25,7 @@ class ModelConfig:
     """Shape and capacity settings needed to construct a DeepAR model."""
 
     cardinalities: list[int]
+    event_cardinalities: list[int]
     covariate_dim: int
     hidden_size: int = 64
     num_layers: int = 1
@@ -89,12 +90,24 @@ class DeepAR(nn.Module):
             return min(50, (cardinality + 1) // 2)
         
         self.embeddings = nn.ModuleList(
-                [nn.Embedding(c, get_emb_dim(c)) for c in config.cardinalities]
-            )
+            [nn.Embedding(c, get_emb_dim(c)) for c in config.cardinalities]
+        )
         static_dim = sum(get_emb_dim(c) for c in config.cardinalities)
-        # Input: prev_scaled_target(1), dynamic_lag_7(1), dynamic_roll_7(1), covariates(dim), static(dim), scale(1)
-        # We add 2 to the input_size for lag_7 and rolling_mean_7
-        input_size = 1 + 2 + config.covariate_dim + static_dim + 1
+
+        self.event_embeddings = nn.ModuleList(
+            [nn.Embedding(c, get_emb_dim(c)) for c in config.event_cardinalities]
+        )
+        event_dim = sum(get_emb_dim(c) for c in config.event_cardinalities)
+
+        # Input components:
+        # 1. Previous scaled target (1)
+        # 2. Dynamic rolling features: mean_7, mean_28 (2)
+        # 3. Dynamic zero counter (1)
+        # 4. Continuous covariates (config.covariate_dim)
+        # 5. Event embeddings (event_dim)
+        # 6. Static embeddings (static_dim)
+        # 7. Log scale (1)
+        input_size = 1 + 2 + 1 + config.covariate_dim + event_dim + static_dim + 1
 
         cells = [] 
         for layer_idx in range(config.num_layers):
@@ -116,6 +129,12 @@ class DeepAR(nn.Module):
         pieces = [embedding(static_cats[:, idx]) for idx, embedding in enumerate(self.embeddings)]
         return torch.cat(pieces, dim=-1)
 
+    def event_embedding(self, event_ids: torch.Tensor) -> torch.Tensor:
+        """Embed and concatenate all temporal categorical events."""
+
+        pieces = [embedding(event_ids[:, idx].long()) for idx, embedding in enumerate(self.event_embeddings)]
+        return torch.cat(pieces, dim=-1)
+
     def initial_state(self, batch_size: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Create zero initial hidden/cell states for every recurrent layer."""
 
@@ -131,21 +150,41 @@ class DeepAR(nn.Module):
         self,
         prev_scaled_target: torch.Tensor,
         target_history: torch.Tensor,
+        zero_counter: torch.Tensor,
         covariates_t: torch.Tensor,
         static_emb: torch.Tensor,
+        scale: torch.Tensor,
         log_scale: torch.Tensor,
         states: list[tuple[torch.Tensor, torch.Tensor]],
-    ) -> tuple[torch.Tensor, torch.Tensor | None, list[tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Run one autoregressive step and produce distribution parameters."""
 
-        # target_history shape: [batch, 28] (or whatever buffer size we chose)
-        # We need lag_7 and rolling_mean_7 (last 7 days)
-        # target_history contains the most recent predictions/targets up to t-1
-        
-        lag_7 = target_history[:, -7 : -6]
+        # Calculate rolling means
         roll_7 = target_history[:, -7:].mean(dim=1, keepdim=True)
+        roll_28 = target_history[:, -28:].mean(dim=1, keepdim=True)
 
-        x = torch.cat([prev_scaled_target, lag_7, roll_7, covariates_t, static_emb, log_scale], dim=-1)
+        # Update zero counter: scale-aware threshold
+        # If the actual units would round to 0 (i.e., < 0.5), increment counter
+        prev_units = prev_scaled_target * scale
+        new_zero_counter = torch.where(prev_units < 0.5, zero_counter + 1.0, torch.zeros_like(zero_counter))
+        
+        # Split covariates_t into continuous and event IDs
+        num_events = len(self.event_embeddings)
+        continuous_covs = covariates_t[:, :self.config.covariate_dim]
+        event_ids = covariates_t[:, self.config.covariate_dim : self.config.covariate_dim + num_events]
+        
+        event_emb = self.event_embedding(event_ids)
+
+        x = torch.cat([
+            prev_scaled_target, 
+            roll_7, 
+            roll_28, 
+            new_zero_counter,
+            continuous_covs, 
+            event_emb,
+            static_emb, 
+            log_scale
+        ], dim=-1)
         
         next_states = []
         for layer_idx, cell in enumerate(self.cells):
@@ -156,7 +195,7 @@ class DeepAR(nn.Module):
         raw = self.output(x)
         mu_scaled = F.softplus(raw[:, :1]) + 1e-4
         alpha = F.softplus(raw[:, 1:2]) + 1e-4 if self.distribution == "negative-binomial" else None
-        return mu_scaled, alpha, next_states
+        return mu_scaled, alpha, new_zero_counter, next_states
 
     def forward(
         self,
@@ -165,6 +204,7 @@ class DeepAR(nn.Module):
         static_cats: torch.Tensor,
         scale: torch.Tensor,
         prior_history: torch.Tensor | None = None,
+        initial_zero_counter: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run teacher-forced training over a full context-plus-horizon window."""
 
@@ -177,18 +217,26 @@ class DeepAR(nn.Module):
             logger.warning("prior_history is not given - initialization will be affected!")
             prior_history = torch.zeros(batch_size, 28, device=target.device)
         
+        if initial_zero_counter is None:
+            initial_zero_counter = torch.zeros(batch_size, 1, device=target.device)
+        elif initial_zero_counter.ndim == 1:
+            initial_zero_counter = initial_zero_counter.unsqueeze(-1)
+        
         # history buffer scaled
         history = prior_history / scale.clamp_min(1e-4)
+        zero_counter = initial_zero_counter
         
         mus = []
         alphas = []
         for step in range(seq_len):
             prev_scaled = history[:, -1:]
-            mu_scaled, alpha, states = self._step(
+            mu_scaled, alpha, zero_counter, states = self._step(
                 prev_scaled,
                 history,
+                zero_counter,
                 covariates[:, step, :],
                 static_emb,
+                scale,
                 log_scale,
                 states,
             )
@@ -211,6 +259,7 @@ class DeepAR(nn.Module):
         scale: torch.Tensor,
         context_length: int,
         prior_history: torch.Tensor | None = None,
+        initial_zero_counter: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode future means autoregressively after consuming known context."""
 
@@ -222,16 +271,24 @@ class DeepAR(nn.Module):
         if prior_history is None:
             prior_history = torch.zeros(batch_size, 28, device=target.device)
         
+        if initial_zero_counter is None:
+            initial_zero_counter = torch.zeros(batch_size, 1, device=target.device)
+        elif initial_zero_counter.ndim == 1:
+            initial_zero_counter = initial_zero_counter.unsqueeze(-1)
+        
         history = prior_history / scale.clamp_min(1e-4)
+        zero_counter = initial_zero_counter
 
         predictions = []
         for step in range(seq_len):
             prev_scaled = history[:, -1:]
-            mu_scaled, _, states = self._step(
+            mu_scaled, _, zero_counter, states = self._step(
                 prev_scaled,
                 history,
+                zero_counter,
                 covariates[:, step, :],
                 static_emb,
+                scale,
                 log_scale,
                 states,
             )
@@ -258,6 +315,7 @@ class DeepAR(nn.Module):
         context_length: int,
         num_samples: int,
         prior_history: torch.Tensor | None = None,
+        initial_zero_counter: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Optimized decoding that avoids redundant context computation."""
 
@@ -274,18 +332,26 @@ class DeepAR(nn.Module):
         if prior_history is None:
             prior_history = torch.zeros(batch_size, 28, device=target.device)
         
+        if initial_zero_counter is None:
+            initial_zero_counter = torch.zeros(batch_size, 1, device=target.device)
+        elif initial_zero_counter.ndim == 1:
+            initial_zero_counter = initial_zero_counter.unsqueeze(-1)
+        
         history = prior_history / scale.clamp_min(1e-4)
+        zero_counter = initial_zero_counter
 
         # ------------------------------------------------------------------
         # PHASE 1: CONSUME CONTEXT
         # ------------------------------------------------------------------
         for step in range(context_length):
             prev_scaled = history[:, -1:]
-            mu_scaled, alpha, states = self._step(
+            mu_scaled, alpha, zero_counter, states = self._step(
                 prev_scaled,
                 history,
+                zero_counter,
                 covariates[:, step, :],
                 static_emb,
+                scale,
                 log_scale,
                 states,
             )
@@ -304,6 +370,7 @@ class DeepAR(nn.Module):
         states = expanded_states
 
         history = duplicate(history)
+        zero_counter = duplicate(zero_counter)
         static_emb = duplicate(static_emb)
         log_scale = duplicate(log_scale)
         repeated_scale = duplicate(scale)
@@ -315,11 +382,13 @@ class DeepAR(nn.Module):
         samples = []
         for step in range(horizon_length):
             prev_scaled = history[:, -1:]
-            mu_scaled, alpha, states = self._step(
+            mu_scaled, alpha, zero_counter, states = self._step(
                 prev_scaled,
                 history,
+                zero_counter,
                 repeated_covariates[:, step, :],
                 static_emb,
+                repeated_scale,
                 log_scale,
                 states,
             )

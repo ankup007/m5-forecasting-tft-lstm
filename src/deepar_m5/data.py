@@ -11,6 +11,7 @@ import pandas as pd
 
 
 STATIC_COLUMNS = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
+EVENT_COLUMNS = ["event_name_1", "event_type_1"]
 logger = logging.getLogger(__name__)
 
 
@@ -24,6 +25,7 @@ class DataConfig:
     prediction_length: int = 28
     seed: int = 42
     sales_file: str = "sales_train_evaluation.csv"
+    use_event_embeddings: bool = True
 
 
 @dataclass
@@ -39,6 +41,8 @@ class M5Bundle:
     day_columns: list[str]
     encoders: dict[str, dict[str, int]]
     covariate_columns: list[str]
+    event_encoders: dict[str, dict[str, int]] | None = None
+    zero_counts: np.ndarray | None = None
 
     @property
     def num_series(self) -> int:
@@ -57,6 +61,14 @@ class M5Bundle:
         """Return embedding cardinalities for each static categorical encoder."""
 
         return [max(mapping.values(), default=0) + 1 for mapping in self.encoders.values()]
+
+    @property
+    def event_cardinalities(self) -> list[int]:
+        """Return cardinalities for dynamic event embeddings."""
+
+        if self.event_encoders is None:
+            return []
+        return [max(mapping.values(), default=0) + 1 for mapping in self.event_encoders.values()]
 
 
 def day_number(day_name: str) -> int:
@@ -81,6 +93,18 @@ def fit_encoders(frame: pd.DataFrame) -> dict[str, dict[str, int]]:
     for column in STATIC_COLUMNS:
         values = sorted(frame[column].astype(str).unique().tolist())
         encoders[column] = {"__UNK__": 0, **{value: idx + 1 for idx, value in enumerate(values)}}
+    return encoders
+
+
+def fit_event_encoders(calendar: pd.DataFrame) -> dict[str, dict[str, int]]:
+    """Fit integer encoders for temporal event metadata columns."""
+
+    encoders: dict[str, dict[str, int]] = {}
+    for column in EVENT_COLUMNS:
+        # Filter out NaN and get unique values
+        values = sorted(calendar[column].dropna().unique().tolist())
+        # 0 is reserved for "No Event"
+        encoders[column] = {"__NONE__": 0, **{value: idx + 1 for idx, value in enumerate(values)}}
     return encoders
 
 
@@ -148,109 +172,180 @@ def select_series(frame: pd.DataFrame, subset_size: int | None, seed: int) -> pd
     return selected
 
 
-def _common_calendar_covariates(calendar: pd.DataFrame) -> tuple[np.ndarray, list[str]]:
-    """Build calendar covariates that are identical for all item-store series.
+def _common_calendar_covariates(
+    calendar: pd.DataFrame, 
+    event_encoders: dict[str, dict[str, int]] | None = None
+) -> tuple[np.ndarray, list[str]]:
+    """Build calendar covariates including normalized time and event features.
 
-    Weekday and month are encoded with sine/cosine pairs so the model sees them
-    as cyclic values. Event columns become binary flags indicating whether an
-    event is present on that day.
+    Weekday and month are encoded with sine/cosine pairs and normalized values.
+    Year, day, and week number are normalized to [-0.5, 0.5].
+    Events are either binary flags or integer IDs for embeddings.
     """
 
+    # Extract date components for normalization
+    dates = pd.to_datetime(calendar["date"])
+    day = dates.dt.day.astype(float).to_numpy()
+    week = dates.dt.isocalendar().week.astype(float).to_numpy()
+    
     wday = calendar["wday"].astype(float).to_numpy()
     month = calendar["month"].astype(float).to_numpy()
-    event_1 = calendar["event_name_1"].notna().astype(float).to_numpy()
-    event_2 = calendar["event_name_2"].notna().astype(float).to_numpy()
-    event_type_1 = calendar["event_type_1"].notna().astype(float).to_numpy()
-    event_type_2 = calendar["event_type_2"].notna().astype(float).to_numpy()
+    year = calendar["year"].astype(float).to_numpy()
+    
+    # M5 wday: 1 (Sat) to 7 (Fri)
+    is_weekend = (wday <= 2).astype(float)
 
-    covariates = np.stack(
-        [
-            np.sin(2.0 * np.pi * wday / 7.0),
-            np.cos(2.0 * np.pi * wday / 7.0),
-            np.sin(2.0 * np.pi * month / 12.0),
-            np.cos(2.0 * np.pi * month / 12.0),
-            event_1,
-            event_2,
-            event_type_1,
-            event_type_2,
-        ],
-        axis=1,
-    ).astype(np.float32)
-    names = [
-        "wday_sin",
-        "wday_cos",
-        "month_sin",
-        "month_cos",
-        "event_name_1_present",
-        "event_name_2_present",
-        "event_type_1_present",
-        "event_type_2_present",
+    # Normalization to [-0.5, 0.5]
+    # wday: [1, 7] -> [-0.5, 0.5]
+    wday_norm = (wday - 4.0) / 6.0
+    # month: [1, 12] -> [-0.5, 0.5]
+    month_norm = (month - 6.5) / 11.0
+    # year: [2011, 2016] -> [-0.5, 0.5] (approximate center 2013.5)
+    year_norm = (year - 2013.5) / 5.0
+    # day: [1, 31] -> [-0.5, 0.5]
+    day_norm = (day - 16.0) / 30.0
+    # week: [1, 53] -> [-0.5, 0.5]
+    week_norm = (week - 27.0) / 52.0
+
+    cov_list = [
+        np.sin(2.0 * np.pi * wday / 7.0),
+        np.cos(2.0 * np.pi * wday / 7.0),
+        np.sin(2.0 * np.pi * month / 12.0),
+        np.cos(2.0 * np.pi * month / 12.0),
+        wday_norm,
+        month_norm,
+        year_norm,
+        day_norm,
+        week_norm,
+        is_weekend,
     ]
-    return covariates, names
+    cov_names = [
+        "wday_sin", "wday_cos", "month_sin", "month_cos",
+        "wday_norm", "month_norm", "year_norm", "day_norm", "week_norm",
+        "is_weekend"
+    ]
+
+    if event_encoders is not None:
+        for col in EVENT_COLUMNS:
+            mapping = event_encoders[col]
+            encoded = calendar[col].fillna("__NONE__").map(mapping).fillna(0).astype(np.float32).to_numpy()
+            cov_list.append(encoded)
+            cov_names.append(f"{col}_id")
+    else:
+        # Fallback to binary flags if no encoders provided
+        event_1 = calendar["event_name_1"].notna().astype(float).to_numpy()
+        event_2 = calendar["event_name_2"].notna().astype(float).to_numpy()
+        event_type_1 = calendar["event_type_1"].notna().astype(float).to_numpy()
+        event_type_2 = calendar["event_type_2"].notna().astype(float).to_numpy()
+        cov_list.extend([event_1, event_2, event_type_1, event_type_2])
+        cov_names.extend(["event_name_1_present", "event_name_2_present", "event_type_1_present", "event_type_2_present"])
+
+    covariates = np.stack(cov_list, axis=1).astype(np.float32)
+    return covariates, cov_names
 
 
 def _build_price_covariates(
     sales_frame: pd.DataFrame,
     calendar: pd.DataFrame,
     prices: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Align weekly sell prices to daily rows for the selected item-store pairs.
+) -> tuple[np.ndarray, list[str]]:
+    """Align weekly sell prices and compute relative price features.
 
-    M5 prices are weekly by ``wm_yr_wk`` while targets are daily. This function
-    builds one daily price row per selected series, fills missing weekly prices
-    with that series' median available price, and returns both ``log1p(price)``
-    and a binary missing-price indicator.
+    Returns:
+        A tuple of (covariate_array, covariate_names).
+        Features: log1p(price), price_missing, relative_price_max, relative_price_dept.
     """
 
-    logger.debug("Raw sell_prices shape=%s", prices.shape)
+    logger.debug("Building price covariates for %s series", len(sales_frame))
     calendar_weeks = calendar["wm_yr_wk"].to_numpy()
-    log_prices = np.zeros((len(sales_frame), len(calendar)), dtype=np.float32)
-    missing = np.ones_like(log_prices, dtype=np.float32)
+    num_series = len(sales_frame)
+    num_days = len(calendar)
+
+    # 1. Pre-calculate department means per week
+    # We need item_id -> dept_id mapping
+    item_dept_map = sales_frame[["item_id", "dept_id"]].drop_duplicates()
+    prices_with_dept = prices.merge(item_dept_map, on="item_id", how="inner")
+    dept_week_means = prices_with_dept.groupby(["dept_id", "wm_yr_wk"])["sell_price"].mean().to_dict()
+
+    # 2. Filter prices to only selected series
     selected_keys = sales_frame[["store_id", "item_id"]].drop_duplicates()
     prices = prices.merge(selected_keys, on=["store_id", "item_id"], how="inner")
-    logger.debug(
-        "Price alignment inputs: calendar_weeks=%s, sales_frame=%s, selected_keys=%s, filtered_prices=%s",
-        len(calendar_weeks),
-        sales_frame.shape,
-        selected_keys.shape,
-        prices.shape,
-    )
-
+    
     price_groups = {
         key: group[["wm_yr_wk", "sell_price"]].to_numpy()
         for key, group in prices.groupby(["store_id", "item_id"], sort=False)
     }
-    logger.debug(
-        "Built %s price lookup groups; sample_keys=%s",
-        len(price_groups),
-        list(price_groups.keys())[:5],
-    )
+
+    log_prices = np.zeros((num_series, num_days), dtype=np.float32)
+    missing = np.ones_like(log_prices, dtype=np.float32)
+    rel_max = np.zeros_like(log_prices, dtype=np.float32)
+    rel_dept = np.zeros_like(log_prices, dtype=np.float32)
+
     for row_idx, row in enumerate(sales_frame.itertuples(index=False)):
         key = (row.store_id, row.item_id)
+        dept = row.dept_id
         weekly_rows = price_groups.get(key)
+        
         if weekly_rows is None or len(weekly_rows) == 0:
             continue
+            
         weekly_map = {int(week): float(price) for week, price in weekly_rows}
         daily = np.array([weekly_map.get(int(week), np.nan) for week in calendar_weeks], dtype=np.float32)
+        
         valid = np.isfinite(daily)
         missing[row_idx] = (~valid).astype(np.float32)
+        
         fill_value = float(np.nanmedian(daily)) if valid.any() else 0.0
         daily = np.where(valid, daily, fill_value)
-        log_prices[row_idx] = np.log1p(np.maximum(daily, 0.0)).astype(np.float32)
+        
+        # log1p price
+        log_prices[row_idx] = np.log1p(np.maximum(daily, 0.0))
+        
+        # relative to max
+        m_val = daily.max()
+        if m_val > 0:
+            rel_max[row_idx] = (daily / m_val) - 0.5 # Center roughly
+            
+        # relative to department mean
+        dept_means = np.array([dept_week_means.get((dept, int(week)), daily_p) for week, daily_p in zip(calendar_weeks, daily)], dtype=np.float32)
+        valid_dept = dept_means > 0
+        rel_dept[row_idx] = np.where(valid_dept, (daily / dept_means) - 1.0, 0.0)
 
-    logger.debug(
-        "Price covariate arrays: log_prices=%s, missing=%s, missing_rate=%.4f",
-        log_prices.shape,
-        missing.shape,
-        float(missing.mean()),
-    )
-    return log_prices, missing
+    covs = np.stack([log_prices, missing, rel_max, rel_dept], axis=2)
+    names = ["log_sell_price", "price_missing", "relative_price_max", "relative_price_dept"]
+    
+    logger.info("Built price covariate cube shape=%s", covs.shape)
+    return covs, names
+
+
+def _calculate_zero_counts(values: np.ndarray) -> np.ndarray:
+    """Pre-calculate continuous zero-sale days for each series and day.
+    
+    Result is a matrix of same shape as values, where each element is 
+    the number of consecutive zero sales up to (but not including) that day.
+    """
+    
+    num_series, num_days = values.shape
+    zero_counts = np.zeros((num_series, num_days + 1), dtype=np.float32)
+    
+    for i in range(num_series):
+        count = 0.0
+        for j in range(num_days):
+            zero_counts[i, j] = count
+            if values[i, j] == 0:
+                count += 1.0
+            else:
+                count = 0.0
+        zero_counts[i, num_days] = count
+        
+    return zero_counts
 
 
 def _build_covariate_cube(
     sales_frame: pd.DataFrame,
     calendar: pd.DataFrame,
     prices: pd.DataFrame,
+    event_encoders: dict[str, dict[str, int]] | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     """Create the full ``series x day x feature`` known-covariate tensor.
 
@@ -260,37 +355,37 @@ def _build_covariate_cube(
 
     num_series = len(sales_frame)
     num_days = len(calendar)
-    common_data, names = _common_calendar_covariates(calendar)
+    
+    # 1. Shared calendar features
+    common_data, names = _common_calendar_covariates(calendar, event_encoders)
     num_common = common_data.shape[1]
     
-    # Pre-allocate the entire cube (11 features total: 8 calendar + 1 snap + 2 price)
-    covariate_names = names + ["snap_state", "log_sell_price", "price_missing"]
+    # 2. Price features
+    price_covs, price_names = _build_price_covariates(sales_frame, calendar, prices)
+    
+    # 3. Full cube allocation (Calendar + SNAP + Price)
+    # SNAP is state-specific
+    covariate_names = names + ["snap_state"] + price_names
     covariates = np.zeros((num_series, num_days, len(covariate_names)), dtype=np.float32)
     
     logger.debug("Allocated covariate cube: %s", covariates.shape)
 
-    # 1. Fill shared calendar features (Broadcasting)
-    # This fills the first 8 features for all series at once without a full copy
+    # Fill calendar features
     covariates[:, :, :num_common] = common_data[None, :, :]
     
-    # 2. Fill SNAP features (State-specific)
-    # Pre-calculate SNAP arrays for each state
+    # Fill SNAP features
     snap_map = {}
     for state in ["CA", "TX", "WI"]:
         snap_map[state] = calendar[f"snap_{state}"].astype(np.float32).to_numpy()
     
-    # Apply snap based on series state
     state_ids = sales_frame["state_id"].astype(str).to_numpy()
     for state, snap_arr in snap_map.items():
         mask = (state_ids == state)
         if mask.any():
-            # Use broadcasting to fill the 9th feature (index 8) for series in this state
             covariates[mask, :, num_common] = snap_arr[None, :]
 
-    # 3. Fill Price features (Series-specific)
-    log_prices, price_missing = _build_price_covariates(sales_frame, calendar, prices)
-    covariates[:, :, num_common + 1] = log_prices
-    covariates[:, :, num_common + 2] = price_missing
+    # Fill Price features
+    covariates[:, :, num_common + 1 : num_common + 1 + len(price_names)] = price_covs
 
     logger.info("Built covariate cube shape=%s with features=%s", covariates.shape, covariate_names)
     return covariates, covariate_names
@@ -344,19 +439,11 @@ def _calculate_lags(values: np.ndarray, scales: np.ndarray, num_calendar_days: i
 def load_m5_bundle(
     config: DataConfig,
     encoders: dict[str, dict[str, int]] | None = None,
+    event_encoders: dict[str, dict[str, int]] | None = None,
     series_ids: list[str] | None = None,
     load_covariates: bool = True,
 ) -> M5Bundle:
-    """Load M5 CSVs and return model-ready arrays plus metadata.
-
-    The loader performs the full data-preparation pipeline: select item-store
-    series, sort daily target columns, encode static categorical ids, build
-    known calendar/price covariates, compute per-series scales, and return a
-    bundle whose arrays are already aligned by series and day.
-
-    When ``series_ids`` is provided, the function preserves that exact order so
-    inference predictions line up with the checkpoint's selected series.
-    """
+    """Load M5 CSVs and return model-ready arrays plus metadata."""
 
     data_dir = Path(config.data_dir)
     sales_path = data_dir / config.sales_file
@@ -366,13 +453,12 @@ def load_m5_bundle(
     logger.info("Loading sales data from %s", sales_path)
     sales = pd.read_csv(sales_path)
     day_columns = find_day_columns(sales.columns)
-    logger.info("Raw sales frame shape=%s; day_columns=%s", sales.shape, len(day_columns))
+    
     if series_ids is not None:
         wanted = set(series_ids)
         sales = sales[sales["id"].isin(wanted)].copy()
         sales["_order"] = sales["id"].map({series_id: idx for idx, series_id in enumerate(series_ids)})
         sales = sales.sort_values("_order").drop(columns=["_order"]).reset_index(drop=True)
-        logger.info("Loaded %s checkpoint-selected series; sales frame shape=%s", len(series_ids), sales.shape)
     else:
         sales = select_series(sales, config.subset_size, config.seed)
 
@@ -380,43 +466,30 @@ def load_m5_bundle(
     calendar["_day_num"] = calendar["d"].map(day_number)
     calendar = calendar.sort_values("_day_num").drop(columns=["_day_num"]).reset_index(drop=True)
     prices = pd.read_csv(data_dir / "sell_prices.csv")
-    logger.info("Calendar shape=%s; sell_prices shape=%s", calendar.shape, prices.shape)
 
     if encoders is None:
-        # Fit on the full metadata so inference has stable ids even if training uses a subset.
         full_sales = pd.read_csv(sales_path, usecols=["id", *STATIC_COLUMNS])
         encoders = fit_encoders(full_sales)
-        logger.debug("Fitted static encoders with cardinalities=%s", [len(mapping) for mapping in encoders.values()])
+        
+    if event_encoders is None and config.use_event_embeddings:
+        event_encoders = fit_event_encoders(calendar)
 
     sales_values = sales[day_columns].to_numpy(dtype=np.float32)
     train_end = max(1, sales_values.shape[1] - config.prediction_length)
     scales = _series_scales(sales_values, train_end=train_end)
     static_cats = encode_static(sales, encoders)
+    
+    # Pre-calculate zero counts (anchor states)
+    zero_counts = _calculate_zero_counts(sales_values)
 
     if load_covariates:
-        covariates, covariate_columns = _build_covariate_cube(sales, calendar, prices)
-        # Add lag and rolling mean features
+        covariates, covariate_columns = _build_covariate_cube(sales, calendar, prices, event_encoders)
         lag_covs, lag_names = _calculate_lags(sales_values, scales, calendar.shape[0])
         covariates = np.concatenate([covariates, lag_covs], axis=2)
         covariate_columns += lag_names
     else:
         covariates = np.zeros((0, 0, 0), dtype=np.float32)
         covariate_columns = []
-
-    logger.info(
-        "Prepared M5 arrays: sales_values=%s, static_cats=%s, scales=%s, covariates=%s",
-        sales_values.shape,
-        static_cats.shape,
-        scales.shape,
-        covariates.shape,
-    )
-    logger.debug(
-        "Validation split: known_days=%s, train_end=%s, context_length=%s, prediction_length=%s",
-        sales_values.shape[1],
-        train_end,
-        config.context_length,
-        config.prediction_length,
-    )
 
     return M5Bundle(
         sales_frame=sales,
@@ -428,6 +501,8 @@ def load_m5_bundle(
         day_columns=day_columns,
         encoders=encoders,
         covariate_columns=covariate_columns,
+        event_encoders=event_encoders,
+        zero_counts=zero_counts,
     )
 
 
@@ -530,9 +605,14 @@ class WindowSampler:
             h_data = self.bundle.sales_values[idx, h_start:h_end]
             prior_history[i, history_len - len(h_data) :] = h_data
 
+        initial_zero_counter = np.zeros((len(series_idx),), dtype=np.float32)
+        if self.bundle.zero_counts is not None:
+            initial_zero_counter = self.bundle.zero_counts[series_idx, start]
+
         batch = {
             "target": targets,
             "prior_history": prior_history,
+            "initial_zero_counter": initial_zero_counter,
             "covariates": self.bundle.covariates[series_idx[:, None], positions[None, :]],
             "static_cats": self.bundle.static_cats[series_idx],
             "scale": self.bundle.scales[series_idx, None],
@@ -572,11 +652,16 @@ class WindowSampler:
             h_data = self.bundle.sales_values[s_idx, h_start:h_end]
             prior_history[i, history_len - len(h_data) :] = h_data
 
+        initial_zero_counter = np.zeros((len(series_idx),), dtype=np.float32)
+        if self.bundle.zero_counts is not None:
+            initial_zero_counter = self.bundle.zero_counts[series_idx, starts]
+
         loss_mask = np.zeros_like(targets, dtype=np.float32)
         loss_mask[:, self.context_length :] = 1.0
         return {
             "target": targets.astype(np.float32),
             "prior_history": prior_history.astype(np.float32),
+            "initial_zero_counter": initial_zero_counter.astype(np.float32),
             "covariates": self.bundle.covariates[series_idx[:, None], positions].astype(np.float32),
             "static_cats": self.bundle.static_cats[series_idx].astype(np.int64),
             "scale": self.bundle.scales[series_idx, None].astype(np.float32),

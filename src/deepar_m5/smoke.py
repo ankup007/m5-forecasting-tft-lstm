@@ -56,7 +56,8 @@ def main(argv: list[str] | None = None) -> None:
     model = DeepAR(
         ModelConfig(
             cardinalities=bundle.cardinalities,
-            covariate_dim=len(bundle.covariate_columns),
+            event_cardinalities=bundle.event_cardinalities,
+            covariate_dim=len(bundle.covariate_columns) - len(bundle.event_cardinalities),
             hidden_size=16,
             distribution=args.loss,
             tweedie_power=args.tweedie_power,
@@ -71,6 +72,7 @@ def main(argv: list[str] | None = None) -> None:
         batch["static_cats"],
         batch["scale"],
         prior_history=batch.get("prior_history"),
+        initial_zero_counter=batch.get("initial_zero_counter"),
     )
     loss = model.loss(batch["target"], mu, aux, batch["loss_mask"])
     assert torch.isfinite(loss), "loss is not finite"
@@ -91,6 +93,7 @@ def main(argv: list[str] | None = None) -> None:
         infer_batch["scale"],
         context_length=args.context_length,
         prior_history=infer_batch.get("prior_history"),
+        initial_zero_counter=infer_batch.get("initial_zero_counter"),
     )
     assert pred.shape == (min(3, bundle.num_series), args.prediction_length)
     assert torch.all(pred >= 0)
@@ -102,6 +105,7 @@ def main(argv: list[str] | None = None) -> None:
         context_length=args.context_length,
         num_samples=4,
         prior_history=infer_batch.get("prior_history"),
+        initial_zero_counter=infer_batch.get("initial_zero_counter"),
     )
     assert samples.shape == (4, min(3, bundle.num_series), args.prediction_length)
     assert torch.all(samples >= 0)

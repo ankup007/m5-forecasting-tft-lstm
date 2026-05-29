@@ -60,10 +60,10 @@ GRID_CONFIG = {
     "num_layers": [2],
     "dropout": [0.1],
     "learning_rate": [0.001],
-    "loss": ["tweedie", "negative-binomial"],
-    "scheduler": ["cosine", None],
+    "loss": ["tweedie"],
+    "scheduler": ["cosine"],
     "eta_min": [0.00001],
-    "tweedie_power": [1.5, 1.7],
+    "tweedie_power": [1.1, 1.3, 1.5, 1.7],
     "tweedie_dispersion": [1.0],
     "seed": [42],
 }
