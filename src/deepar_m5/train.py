@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from tqdm import trange
+from tqdm.auto import trange
 
 from .data import DataConfig, WindowSampler, config_to_dict, load_m5_bundle, save_json
 from .evaluation import (
@@ -105,7 +105,7 @@ def train_epoch(
 
     model.train()
     running_loss = 0.0
-    progress = trange(steps_per_epoch, desc=f"epoch {epoch}", leave=False)
+    progress = trange(steps_per_epoch, desc=f"epoch {epoch}", leave=True)
     for step_idx in progress:
         global_step = (epoch - 1) * steps_per_epoch + step_idx + 1
         batch_np = sampler.sample_train_batch(batch_size)

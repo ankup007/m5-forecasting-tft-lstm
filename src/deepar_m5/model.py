@@ -110,6 +110,7 @@ class DeepAR(nn.Module):
         input_size = 1 + 2 + 1 + config.covariate_dim + event_dim + static_dim + 1
 
         cells = [] 
+        norms = []
         for layer_idx in range(config.num_layers):
             cells.append(
                 ScratchLSTMCell(
@@ -117,7 +118,10 @@ class DeepAR(nn.Module):
                     hidden_size=config.hidden_size,
                 )
             )
+            norms.append(nn.LayerNorm(config.hidden_size))
+
         self.cells = nn.ModuleList(cells)
+        self.norms = nn.ModuleList(norms)
         self.dropout = nn.Dropout(config.dropout)
         self.distribution = normalize_distribution(config.distribution)
         output_dim = 2 if self.distribution == "negative-binomial" else 1
@@ -159,14 +163,18 @@ class DeepAR(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Run one autoregressive step and produce distribution parameters."""
 
-        # Calculate rolling means
+        # Calculate rolling means (already in [0, ~2] range usually)
         roll_7 = target_history[:, -7:].mean(dim=1, keepdim=True)
         roll_28 = target_history[:, -28:].mean(dim=1, keepdim=True)
 
         # Update zero counter: scale-aware threshold
-        # If the actual units would round to 0 (i.e., < 0.5), increment counter
         prev_units = prev_scaled_target * scale
         new_zero_counter = torch.where(prev_units < 0.5, zero_counter + 1.0, torch.zeros_like(zero_counter))
+        
+        # NORMALIZE counter for LSTM input: 
+        # log1p maps [0, 50, 1000] -> [0, 3.9, 6.9]. 
+        # Dividing by 4.0 centers typical droughts in the [0, 1] range.
+        zero_counter_norm = torch.log1p(new_zero_counter) / 4.0
         
         # Split covariates_t into continuous and event IDs
         num_events = len(self.event_embeddings)
@@ -175,20 +183,24 @@ class DeepAR(nn.Module):
         
         event_emb = self.event_embedding(event_ids)
 
+        # Also normalize the static log_scale input (Walmart scales range 1 to 500+, log1p is 0 to ~6)
+        log_scale_norm = log_scale / 5.0
+
         x = torch.cat([
             prev_scaled_target, 
             roll_7, 
             roll_28, 
-            new_zero_counter,
+            zero_counter_norm,
             continuous_covs, 
             event_emb,
             static_emb, 
-            log_scale
+            log_scale_norm
         ], dim=-1)
         
         next_states = []
         for layer_idx, cell in enumerate(self.cells):
             h, c = cell(x, states[layer_idx])
+            h = self.norms[layer_idx](h) # Apply LayerNorm
             x = self.dropout(h) if layer_idx < len(self.cells) - 1 else h
             next_states.append((h, c))
 

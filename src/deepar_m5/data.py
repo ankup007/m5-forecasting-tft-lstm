@@ -175,12 +175,11 @@ def select_series(frame: pd.DataFrame, subset_size: int | None, seed: int) -> pd
 def _common_calendar_covariates(
     calendar: pd.DataFrame, 
     event_encoders: dict[str, dict[str, int]] | None = None
-) -> tuple[np.ndarray, list[str]]:
+) -> tuple[np.ndarray, list[str], np.ndarray, list[str]]:
     """Build calendar covariates including normalized time and event features.
 
-    Weekday and month are encoded with sine/cosine pairs and normalized values.
-    Year, day, and week number are normalized to [-0.5, 0.5].
-    Events are either binary flags or integer IDs for embeddings.
+    Returns:
+        A tuple of (continuous_covs, continuous_names, categorical_covs, categorical_names).
     """
 
     # Extract date components for normalization
@@ -196,18 +195,13 @@ def _common_calendar_covariates(
     is_weekend = (wday <= 2).astype(float)
 
     # Normalization to [-0.5, 0.5]
-    # wday: [1, 7] -> [-0.5, 0.5]
     wday_norm = (wday - 4.0) / 6.0
-    # month: [1, 12] -> [-0.5, 0.5]
     month_norm = (month - 6.5) / 11.0
-    # year: [2011, 2016] -> [-0.5, 0.5] (approximate center 2013.5)
     year_norm = (year - 2013.5) / 5.0
-    # day: [1, 31] -> [-0.5, 0.5]
     day_norm = (day - 16.0) / 30.0
-    # week: [1, 53] -> [-0.5, 0.5]
     week_norm = (week - 27.0) / 52.0
 
-    cov_list = [
+    cont_list = [
         np.sin(2.0 * np.pi * wday / 7.0),
         np.cos(2.0 * np.pi * wday / 7.0),
         np.sin(2.0 * np.pi * month / 12.0),
@@ -219,29 +213,31 @@ def _common_calendar_covariates(
         week_norm,
         is_weekend,
     ]
-    cov_names = [
+    cont_names = [
         "wday_sin", "wday_cos", "month_sin", "month_cos",
         "wday_norm", "month_norm", "year_norm", "day_norm", "week_norm",
         "is_weekend"
     ]
 
+    cat_list = []
+    cat_names = []
+
     if event_encoders is not None:
         for col in EVENT_COLUMNS:
             mapping = event_encoders[col]
             encoded = calendar[col].fillna("__NONE__").map(mapping).fillna(0).astype(np.float32).to_numpy()
-            cov_list.append(encoded)
-            cov_names.append(f"{col}_id")
+            cat_list.append(encoded)
+            cat_names.append(f"{col}_id")
     else:
-        # Fallback to binary flags if no encoders provided
-        event_1 = calendar["event_name_1"].notna().astype(float).to_numpy()
-        event_2 = calendar["event_name_2"].notna().astype(float).to_numpy()
-        event_type_1 = calendar["event_type_1"].notna().astype(float).to_numpy()
-        event_type_2 = calendar["event_type_2"].notna().astype(float).to_numpy()
-        cov_list.extend([event_1, event_2, event_type_1, event_type_2])
-        cov_names.extend(["event_name_1_present", "event_name_2_present", "event_type_1_present", "event_type_2_present"])
+        # Fallback to zeros/placeholders if no encoders
+        for col in EVENT_COLUMNS:
+            cat_list.append(np.zeros_like(wday))
+            cat_names.append(f"{col}_id")
 
-    covariates = np.stack(cov_list, axis=1).astype(np.float32)
-    return covariates, cov_names
+    continuous_covariates = np.stack(cont_list, axis=1).astype(np.float32)
+    categorical_covariates = np.stack(cat_list, axis=1).astype(np.float32)
+    
+    return continuous_covariates, cont_names, categorical_covariates, cat_names
 
 
 def _build_price_covariates(
@@ -349,31 +345,32 @@ def _build_covariate_cube(
 ) -> tuple[np.ndarray, list[str]]:
     """Create the full ``series x day x feature`` known-covariate tensor.
 
-    Allocates the full tensor once and fills it in-place to minimize peak 
-    memory usage during broad-dataset runs.
+    Features are strictly ordered: all Continuous first, then all Categorical.
     """
 
     num_series = len(sales_frame)
     num_days = len(calendar)
     
-    # 1. Shared calendar features
-    common_data, names = _common_calendar_covariates(calendar, event_encoders)
-    num_common = common_data.shape[1]
-    
-    # 2. Price features
+    # 1. Base components
+    cont_common, cont_names, cat_common, cat_names = _common_calendar_covariates(calendar, event_encoders)
     price_covs, price_names = _build_price_covariates(sales_frame, calendar, prices)
     
-    # 3. Full cube allocation (Calendar + SNAP + Price)
-    # SNAP is state-specific
-    covariate_names = names + ["snap_state"] + price_names
+    num_cont_common = cont_common.shape[1]
+    num_price = price_covs.shape[2]
+    num_cat = cat_common.shape[1]
+    
+    # 2. Re-ordered allocation: [Cont Common (10), SNAP (1), Price (4), Categorical (2)]
+    # We leave Categorical for the very end of the cube
+    covariate_names = cont_names + ["snap_state"] + price_names + cat_names
     covariates = np.zeros((num_series, num_days, len(covariate_names)), dtype=np.float32)
     
     logger.debug("Allocated covariate cube: %s", covariates.shape)
 
-    # Fill calendar features
-    covariates[:, :, :num_common] = common_data[None, :, :]
+    # Fill continuous components
+    covariates[:, :, :num_cont_common] = cont_common[None, :, :]
     
-    # Fill SNAP features
+    # SNAP at index num_cont_common
+    snap_idx = num_cont_common
     snap_map = {}
     for state in ["CA", "TX", "WI"]:
         snap_map[state] = calendar[f"snap_{state}"].astype(np.float32).to_numpy()
@@ -382,10 +379,15 @@ def _build_covariate_cube(
     for state, snap_arr in snap_map.items():
         mask = (state_ids == state)
         if mask.any():
-            covariates[mask, :, num_common] = snap_arr[None, :]
+            covariates[mask, :, snap_idx] = snap_arr[None, :]
 
-    # Fill Price features
-    covariates[:, :, num_common + 1 : num_common + 1 + len(price_names)] = price_covs
+    # Price features start after SNAP
+    price_start = snap_idx + 1
+    covariates[:, :, price_start : price_start + num_price] = price_covs
+
+    # Categorical features at the very end
+    cat_start = price_start + num_price
+    covariates[:, :, cat_start : cat_start + num_cat] = cat_common[None, :, :]
 
     logger.info("Built covariate cube shape=%s with features=%s", covariates.shape, covariate_names)
     return covariates, covariate_names
@@ -483,10 +485,23 @@ def load_m5_bundle(
     zero_counts = _calculate_zero_counts(sales_values)
 
     if load_covariates:
+        # 1. Base covariates strictly ordered: [Continuous (15), Categorical (2)]
         covariates, covariate_columns = _build_covariate_cube(sales, calendar, prices, event_encoders)
+        num_cat = len(event_encoders) if event_encoders else 0
+        
+        # 2. Extract 28-day lags (Continuous)
         lag_covs, lag_names = _calculate_lags(sales_values, scales, calendar.shape[0])
-        covariates = np.concatenate([covariates, lag_covs], axis=2)
-        covariate_columns += lag_names
+        
+        # 3. Final Concatenation strictly ordered: [Continuous (15), Lag (1), Categorical (2)]
+        # This keeps all continuous features in a single block at the beginning
+        cont_block = covariates[:, :, :-num_cat] if num_cat > 0 else covariates
+        cat_block = covariates[:, :, -num_cat:] if num_cat > 0 else np.zeros((bundle.num_series, calendar.shape[0], 0))
+        
+        final_covs = np.concatenate([cont_block, lag_covs, cat_block], axis=2)
+        final_names = covariate_columns[:-num_cat] + lag_names + covariate_columns[-num_cat:] if num_cat > 0 else covariate_columns + lag_names
+        
+        covariates = final_covs
+        covariate_columns = final_names
     else:
         covariates = np.zeros((0, 0, 0), dtype=np.float32)
         covariate_columns = []
