@@ -1,7 +1,13 @@
 import streamlit as st
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 import scipy.stats as stats
+from pathlib import Path
+import pandas as pd
+
+# Fix for Segmentation Faults on Windows/Linux with Streamlit
+matplotlib.use('Agg')
 
 st.set_page_config(page_title="M5 Distribution Explorer", layout="wide")
 
@@ -42,6 +48,7 @@ case_study = st.selectbox("Select a Product Persona", [
     "The 'SNAP Day' Shift (Promotion Effect)"
 ])
 
+# Override sliders if a persona is selected
 if case_study == "Slow-Moving Hobby Item (Intermittent)":
     mu, alpha, p, phi = 0.3, 0.5, 1.2, 1.0
     st.success("📝 **Context**: This item (e.g., a specific craft kit) sells maybe once or twice a week. Note the massive **Zero Spike** in both graphs.")
@@ -54,10 +61,24 @@ elif case_study == "The 'SNAP Day' Shift (Promotion Effect)":
 else:
     st.info("Use the sidebar sliders to create your own scenario.")
 
-# --- Simulation Logic (Re-run with case study params if selected) ---
-if case_study != "Custom (Manual Sliders)":
-    nb_data = get_nbinom_samples(mu, alpha, num_samples)
-    tw_data = get_tweedie_samples(mu, p, phi, num_samples)
+# --- Simulation Logic (Functions) ---
+def get_nbinom_samples(mu, alpha, n):
+    prob = alpha / (alpha + mu)
+    return stats.nbinom.rvs(alpha, prob, size=n)
+
+def get_tweedie_samples(mu, p, phi, n):
+    lambda_p = (mu**(2-p)) / (phi * (2-p))
+    poisson_counts = np.random.poisson(lambda_p, size=n)
+    alpha_g = (2-p) / (p-1)
+    theta_g = phi * (p-1) * (mu**(p-1))
+    samples = np.zeros(n)
+    pos = poisson_counts > 0
+    samples[pos] = np.random.gamma(poisson_counts[pos] * alpha_g, theta_g)
+    return samples
+
+# ALWAYS generate data using either persona or slider values
+nb_data = get_nbinom_samples(mu, alpha, num_samples)
+tw_data = get_tweedie_samples(mu, p, phi, num_samples)
 
 # --- Visualization ---
 col1, col2 = st.columns(2)

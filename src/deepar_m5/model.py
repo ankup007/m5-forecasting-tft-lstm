@@ -33,6 +33,12 @@ class ModelConfig:
     distribution: str = "negative-binomial"
     tweedie_power: float = 1.5
     tweedie_dispersion: float = 1.0
+    prior_history_length: int = 28
+    rolling_short_window: int = 7
+    rolling_long_window: int = 28
+    zero_counter_log_divisor: float = 4.0
+    log_scale_divisor: float = 5.0
+    nb_alpha_max: float = 1e4
 
 
 class ScratchLSTMCell(nn.Module):
@@ -98,6 +104,8 @@ class DeepAR(nn.Module):
             [nn.Embedding(c, get_emb_dim(c)) for c in config.event_cardinalities]
         )
         event_dim = sum(get_emb_dim(c) for c in config.event_cardinalities)
+        if config.prior_history_length < config.rolling_long_window:
+            raise ValueError("prior_history_length must be at least rolling_long_window.")
 
         # Input components:
         # 1. Previous scaled target (1)
@@ -122,6 +130,8 @@ class DeepAR(nn.Module):
 
         self.cells = nn.ModuleList(cells)
         self.norms = nn.ModuleList(norms)
+        # Match PyTorch LSTM dropout semantics: dropout is inter-layer only, so
+        # a one-layer model intentionally sees no dropout from this module.
         self.dropout = nn.Dropout(config.dropout)
         self.distribution = normalize_distribution(config.distribution)
         output_dim = 2 if self.distribution == "negative-binomial" else 1
@@ -137,6 +147,8 @@ class DeepAR(nn.Module):
         """Embed and concatenate all temporal categorical events."""
 
         pieces = [embedding(event_ids[:, idx].long()) for idx, embedding in enumerate(self.event_embeddings)]
+        if not pieces:
+            return event_ids.new_zeros((event_ids.shape[0], 0), dtype=torch.float32)
         return torch.cat(pieces, dim=-1)
 
     def initial_state(self, batch_size: int, device: torch.device) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -163,9 +175,12 @@ class DeepAR(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Run one autoregressive step and produce distribution parameters."""
 
-        # Calculate rolling means (already in [0, ~2] range usually)
-        roll_7 = target_history[:, -7:].mean(dim=1, keepdim=True)
-        roll_28 = target_history[:, -28:].mean(dim=1, keepdim=True)
+        # Calculate rolling means from the recurrent history buffer. ``lag_28``
+        # remains a known point-lag covariate, while this is an autoregressive
+        # trailing average that follows teacher-forced targets during training
+        # and model outputs during sampling.
+        roll_7 = target_history[:, -self.config.rolling_short_window :].mean(dim=1, keepdim=True)
+        roll_28 = target_history[:, -self.config.rolling_long_window :].mean(dim=1, keepdim=True)
 
         # Update zero counter: scale-aware threshold
         prev_units = prev_scaled_target * scale
@@ -173,8 +188,8 @@ class DeepAR(nn.Module):
         
         # NORMALIZE counter for LSTM input: 
         # log1p maps [0, 50, 1000] -> [0, 3.9, 6.9]. 
-        # Dividing by 4.0 centers typical droughts in the [0, 1] range.
-        zero_counter_norm = torch.log1p(new_zero_counter) / 4.0
+        # Dividing by the configured divisor centers typical droughts in the [0, 1] range.
+        zero_counter_norm = torch.log1p(new_zero_counter) / self.config.zero_counter_log_divisor
         
         # Split covariates_t into continuous and event IDs
         num_events = len(self.event_embeddings)
@@ -183,8 +198,8 @@ class DeepAR(nn.Module):
         
         event_emb = self.event_embedding(event_ids)
 
-        # Also normalize the static log_scale input (Walmart scales range 1 to 500+, log1p is 0 to ~6)
-        log_scale_norm = log_scale / 5.0
+        # Also normalize the static log_scale input.
+        log_scale_norm = log_scale / self.config.log_scale_divisor
 
         x = torch.cat([
             prev_scaled_target, 
@@ -200,7 +215,9 @@ class DeepAR(nn.Module):
         next_states = []
         for layer_idx, cell in enumerate(self.cells):
             h, c = cell(x, states[layer_idx])
-            h = self.norms[layer_idx](h) # Apply LayerNorm
+            # Store the normalized hidden state as recurrent state; this keeps
+            # gate inputs stable but deliberately changes vanilla LSTM dynamics.
+            h = self.norms[layer_idx](h)
             x = self.dropout(h) if layer_idx < len(self.cells) - 1 else h
             next_states.append((h, c))
 
@@ -217,17 +234,39 @@ class DeepAR(nn.Module):
         scale: torch.Tensor,
         prior_history: torch.Tensor | None = None,
         initial_zero_counter: torch.Tensor | None = None,
+        context_length: int | None = None,
+        rolled_feedback_prob: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run teacher-forced training over a full context-plus-horizon window."""
+        """Run one training window with optional rolled feedback.
+
+        By default this is standard DeepAR teacher forcing: every recurrent
+        feedback value comes from the observed target. When
+        ``rolled_feedback_prob`` is positive and ``context_length`` is supplied,
+        context steps remain teacher-forced but forecast-horizon steps
+        stochastically feed detached samples from the model's own predictive
+        distribution. The loss is still computed against ground truth; only the
+        recurrent input path is perturbed to reduce train/inference mismatch.
+        """
 
         batch_size, seq_len = target.shape
+        if context_length is None:
+            context_length = seq_len
+        if not 0 <= context_length <= seq_len:
+            raise ValueError(f"context_length must be in [0, {seq_len}], found {context_length}.")
+        rolled_feedback_prob = min(max(float(rolled_feedback_prob), 0.0), 1.0)
+
         static_emb = self.static_embedding(static_cats)
         log_scale = torch.log1p(scale)
         states = self.initial_state(batch_size, target.device)
 
         if prior_history is None:
             logger.warning("prior_history is not given - initialization will be affected!")
-            prior_history = torch.zeros(batch_size, 28, device=target.device)
+            prior_history = torch.zeros(batch_size, self.config.prior_history_length, device=target.device)
+        elif prior_history.shape[1] != self.config.prior_history_length:
+            raise ValueError(
+                f"Expected prior_history length {self.config.prior_history_length}, "
+                f"found {prior_history.shape[1]}."
+            )
         
         if initial_zero_counter is None:
             initial_zero_counter = torch.zeros(batch_size, 1, device=target.device)
@@ -256,8 +295,15 @@ class DeepAR(nn.Module):
             if alpha is not None:
                 alphas.append(alpha)
             
-            # Update history with ground truth (teacher forcing)
-            next_target_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+            truth_scaled = target[:, step : step + 1] / scale.clamp_min(1e-4)
+            if rolled_feedback_prob > 0.0 and step >= context_length:
+                with torch.no_grad():
+                    sampled_units = self.sample(mu_scaled * scale, alpha)
+                    sampled_scaled = sampled_units / scale.clamp_min(1e-4)
+                use_sample = torch.rand_like(truth_scaled) < rolled_feedback_prob
+                next_target_scaled = torch.where(use_sample, sampled_scaled, truth_scaled)
+            else:
+                next_target_scaled = truth_scaled
             history = torch.cat([history[:, 1:], next_target_scaled], dim=1)
 
         return torch.cat(mus, dim=1), torch.cat(alphas, dim=1) if alphas else None
@@ -281,7 +327,12 @@ class DeepAR(nn.Module):
         states = self.initial_state(batch_size, target.device)
 
         if prior_history is None:
-            prior_history = torch.zeros(batch_size, 28, device=target.device)
+            prior_history = torch.zeros(batch_size, self.config.prior_history_length, device=target.device)
+        elif prior_history.shape[1] != self.config.prior_history_length:
+            raise ValueError(
+                f"Expected prior_history length {self.config.prior_history_length}, "
+                f"found {prior_history.shape[1]}."
+            )
         
         if initial_zero_counter is None:
             initial_zero_counter = torch.zeros(batch_size, 1, device=target.device)
@@ -329,7 +380,7 @@ class DeepAR(nn.Module):
         prior_history: torch.Tensor | None = None,
         initial_zero_counter: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Optimized decoding that avoids redundant context computation."""
+        """Optimized decoding that returns samples as ``[num_samples, batch, horizon]``."""
 
         if num_samples <= 0:
             raise ValueError("num_samples must be positive")
@@ -342,7 +393,12 @@ class DeepAR(nn.Module):
         states = self.initial_state(batch_size, target.device)
         
         if prior_history is None:
-            prior_history = torch.zeros(batch_size, 28, device=target.device)
+            prior_history = torch.zeros(batch_size, self.config.prior_history_length, device=target.device)
+        elif prior_history.shape[1] != self.config.prior_history_length:
+            raise ValueError(
+                f"Expected prior_history length {self.config.prior_history_length}, "
+                f"found {prior_history.shape[1]}."
+            )
         
         if initial_zero_counter is None:
             initial_zero_counter = torch.zeros(batch_size, 1, device=target.device)
@@ -413,7 +469,8 @@ class DeepAR(nn.Module):
             history = torch.cat([history[:, 1:], sample_scaled], dim=1)
 
         stacked = torch.cat(samples, dim=1)
-        return stacked.view(batch_size, num_samples, -1).transpose(0, 1).contiguous()
+        samples_by_batch = stacked.view(batch_size, num_samples, horizon_length)
+        return samples_by_batch.transpose(0, 1).contiguous()
 
     def loss(
         self,
@@ -442,7 +499,7 @@ class DeepAR(nn.Module):
         if self.distribution == "negative-binomial":
             if aux is None:
                 raise ValueError("Negative Binomial sampling requires alpha.")
-            return sample_negative_binomial(mu, aux)
+            return sample_negative_binomial(mu, aux, alpha_max=self.config.nb_alpha_max)
         return sample_tweedie(
             mu,
             power=self.config.tweedie_power,
@@ -545,20 +602,24 @@ def masked_forecast_loss(
 
 
 def model_config_from_dict(payload: dict) -> ModelConfig:
-    """Create ``ModelConfig`` while ignoring stale checkpoint-only keys."""
+    """Create ``ModelConfig`` and fail clearly on unsupported checkpoint keys."""
 
     valid_keys = set(ModelConfig.__dataclass_fields__)
+    migration_keys = {"loss"}
+    unknown = sorted(set(payload) - valid_keys - migration_keys)
+    if unknown:
+        raise ValueError(f"Unrecognized ModelConfig keys in checkpoint: {unknown}")
     filtered = {key: value for key, value in payload.items() if key in valid_keys}
     if "loss" in payload and "distribution" not in filtered:
         filtered["distribution"] = payload["loss"]
     return ModelConfig(**filtered)
 
 
-def sample_negative_binomial(mu: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+def sample_negative_binomial(mu: torch.Tensor, alpha: torch.Tensor, alpha_max: float = 1e4) -> torch.Tensor:
     """Sample counts from the same Negative Binomial parameterization used by the loss."""
 
     mu = mu.clamp_min(1e-6)
-    alpha = alpha.clamp_min(1e-6)
+    alpha = alpha.clamp(1e-6, max(float(alpha_max), 1.0))
     probs = (mu / (mu + alpha)).clamp(1e-6, 1.0 - 1e-6)
     distribution = torch.distributions.NegativeBinomial(total_count=alpha, probs=probs)
     return distribution.sample()

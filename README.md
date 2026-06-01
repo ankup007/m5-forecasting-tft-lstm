@@ -48,12 +48,41 @@ For a code walkthrough, tuning guide, and extension notes, read [DeepAR Implemen
 
 For the training/prediction mechanics, including teacher forcing, autoregressive rollout, Negative Binomial likelihood, and mean versus sampled forecasts, read [Understanding DeepAR Training And Prediction](./DEEPAR_TRAINING_AND_PREDICTION_README.md).
 
+## Rolled DeepAR Experiments For M5
+
+The current DeepAR path now includes an M5-focused training mode inspired by Jeon and Seong's third-place M5 Accuracy solution, which modified DeepAR for intermittent retail demand. The main problem being addressed is exposure bias: standard DeepAR trains with true previous targets as recurrent inputs, but inference must feed back the model's own forecasts. On M5, this mismatch is especially damaging because many item-store series contain long zero runs followed by sudden bursts.
+
+The implementation supports:
+
+- **Scheduled rolled feedback:** during forecast-horizon training steps, the model can feed back sampled predictions instead of always feeding ground truth. The probability is controlled by `rolled_feedback_max_prob`, `rolled_feedback_warmup_epochs`, and `rolled_feedback_ramp_epochs`.
+- **Rolling-origin autoregressive validation:** checkpoints can be selected using forecasts generated the same way inference works, across several historical 28-day origins.
+- **Spike diagnostics:** validation and holdout metrics include zero-day false positive rate, nonzero-day MAE, spike-day MAE, spike hit rate, and spike bias.
+- **NB vs Tweedie comparison:** experiments can compare Negative Binomial and Tweedie objectives under the same autoregressive validation protocol.
+
+The main experiment entry point is:
+
+```powershell
+python -m src.deepar_m5.experiments --data-dir m5-forecasting-accuracy --eval-wrmsse
+```
+
+Edit `GRID_CONFIG` in [experiments.py](./src/deepar_m5/experiments.py) before running. A practical first sweep is:
+
+- `loss`: `["tweedie", "negative-binomial"]`
+- `rolled_feedback_max_prob`: `[0.0, 0.5]`
+- `autoreg_val_origins`: `[4]`
+- `autoreg_val_stride`: `[28]`
+- `checkpoint_metric`: `["autoreg_wrmsse"]`
+
+For full-data runs, `autoreg_val_every=5` keeps rolling validation cost under control. For small subset debugging, set `autoreg_val_every=1`, reduce `epochs`, and reduce `steps_per_epoch`.
+
 ## References
 
 This analysis references foundational papers including:
 - *Temporal Fusion Transformers for Interpretable Multi-horizon Time Series Forecasting* (Lim et al., 2020)
 - *DeepAR: Probabilistic Forecasting with Autoregressive Recurrent Networks* (Salinas et al., 2020)
 - *The M5 competition: Background, organization, and implementation* (Makridakis et al., 2022)
+- *Robust recurrent network model for intermittent time-series forecasting* (Jeon and Seong, 2022)
+- *Scheduled Sampling for Sequence Prediction with Recurrent Neural Networks* (Bengio et al., 2015)
 
 ---
 *Created as part of an exploration into large-scale retail demand forecasting.*

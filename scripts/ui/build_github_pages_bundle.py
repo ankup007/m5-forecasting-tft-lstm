@@ -35,21 +35,25 @@ def main() -> None:
 
     bundle_run_dir = output_dir / run_dir.name
     bundle_run_dir.mkdir(parents=True, exist_ok=True)
-    bundle_series_json_dir = bundle_run_dir / "series_json"
-    if not bundle_series_json_dir.exists():
-        shutil.copytree(series_json_dir, bundle_series_json_dir)
-    else:
-        for filename in ["run_summary.json", "series_index.json"]:
-            source = series_json_dir / filename
-            target = bundle_series_json_dir / filename
-            if source.exists():
-                shutil.copy2(source, target)
-        source_series_dir = series_json_dir / "series"
-        target_series_dir = bundle_series_json_dir / "series"
-        if source_series_dir.exists():
-            target_series_dir.mkdir(parents=True, exist_ok=True)
-            for source_file in source_series_dir.glob("*.json"):
-                shutil.copy2(source_file, target_series_dir / source_file.name)
+    
+    # Discover all series_json* directories
+    series_json_dirs = [d for d in run_dir.iterdir() if d.is_dir() and d.name.startswith("series_json")]
+    for series_json_dir in series_json_dirs:
+        bundle_series_json_dir = bundle_run_dir / series_json_dir.name
+        if not bundle_series_json_dir.exists():
+            shutil.copytree(series_json_dir, bundle_series_json_dir)
+        else:
+            for filename in ["run_summary.json", "series_index.json", "wrmsse.json"]:
+                source = series_json_dir / filename
+                target = bundle_series_json_dir / filename
+                if source.exists():
+                    shutil.copy2(source, target)
+            source_series_dir = series_json_dir / "series"
+            target_series_dir = bundle_series_json_dir / "series"
+            if source_series_dir.exists():
+                target_series_dir.mkdir(parents=True, exist_ok=True)
+                for source_file in source_series_dir.glob("*.json"):
+                    shutil.copy2(source_file, target_series_dir / source_file.name)
     global_naive_dir = run_dir.parent / "naive_forecasts"
     if global_naive_dir.exists():
         bundle_naive_dir = output_dir / "naive_forecasts"

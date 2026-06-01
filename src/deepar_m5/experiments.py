@@ -1,3 +1,52 @@
+"""Run DeepAR/M5 experiment sweeps from one editable configuration file.
+
+This module is intended to be the main place to launch comparison runs. Edit
+``GRID_CONFIG`` below, then run:
+
+    python -m src.deepar_m5.experiments --data-dir m5-forecasting-accuracy
+
+Important grid controls:
+
+``loss``
+    Use ``"negative-binomial"`` and ``"tweedie"`` for intermittent-demand experiments.
+    Tweedie uses ``tweedie_power`` and ``tweedie_dispersion``.
+
+``rolled_feedback_max_prob``
+    Maximum probability of feeding the model's own sampled forecast back into
+    the recurrent history during forecast-horizon training steps. ``0.0`` is
+    standard teacher forcing. Values around ``0.25`` to ``0.50`` are the first
+    serious trials for M5 because they reduce exposure bias without making early
+    training fully self-fed.
+
+``rolled_feedback_warmup_epochs`` and ``rolled_feedback_ramp_epochs``
+    Curriculum for rolled feedback. During warmup, training is pure teacher
+    forcing. Over the ramp, feedback probability increases linearly to
+    ``rolled_feedback_max_prob``. Example: warmup ``3`` and ramp ``10`` means
+    epochs 1-3 use 0.0, and epoch 13 onward uses the configured maximum.
+
+``autoreg_val_origins`` and ``autoreg_val_stride``
+    Rolling-origin validation setup. ``autoreg_val_origins=4`` and stride ``28``
+    evaluates the latest validation window plus three earlier 28-day windows.
+    This is closer to the M5 robustness recommendations than selecting a model
+    from one teacher-forced validation loss.
+
+``autoreg_val_every``
+    Frequency, in epochs, for expensive autoregressive validation. Use ``1`` for
+    small subsets; use ``3`` to ``5`` for full 30,490-series sweeps.
+
+``checkpoint_metric``
+    Metric used to choose ``best.pt``. Recommended starting value is
+    ``"autoreg_wrmsse"``. Alternatives are ``"autoreg_rmsse"``,
+    ``"autoreg_wape"``, ``"autoreg_spike_day_mae"``, and ``"teacher_loss"``.
+
+Practical first sweep:
+    Keep the model size fixed and compare four cells: negative-binomial versus
+    Tweedie crossed with rolled feedback 0.0 versus 0.5. Use autoregressive
+    WRMSSE and spike diagnostics as the judge, not only internal likelihood.
+"""
+
+from __future__ import annotations
+
 import argparse
 import itertools
 import json
@@ -19,13 +68,14 @@ logger = logging.getLogger(__name__)
 def run_name(index: int, params: dict[str, int | float | str]) -> str:
     """Build a compact directory name for one experiment configuration."""
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pieces = [
         f"run_{timestamp}_{index:03d}",
         f"subset{params['subset_size']}",
         f"ctx{params['context_length']}",
         f"h{params['hidden_size']}",
         f"loss{str(params.get('loss', 'negative-binomial')).replace('-', '')}",
+        f"roll{int(float(params.get('rolled_feedback_max_prob', 0.0)) * 100):02d}",
         f"ep{params['epochs']}",
         f"steps{params['steps_per_epoch']}",
     ]
@@ -52,12 +102,14 @@ def run_name(index: int, params: dict[str, int | float | str]) -> str:
 #   try [0.5, 1.0, 2.0] if Tweedie is competitive.
 GRID_CONFIG = {
     "subset_size": [30490],
-    "context_length": [168],
-    "batch_size": [256],
-    "epochs": [50],
-    "steps_per_epoch": [100],
-    "hidden_size": [64],
-    "num_layers": [3],
+    # Sweep defaults intentionally use longer context and a deeper model than
+    # train.py's quick single-run defaults.
+    "context_length": [28],
+    "batch_size": [64],
+    "epochs": [300],
+    "steps_per_epoch": [500],
+    "hidden_size": [128],
+    "num_layers": [2],
     "dropout": [0.1],
     "learning_rate": [0.001],
     "loss": ["tweedie", "negative-binomial"],
@@ -65,6 +117,15 @@ GRID_CONFIG = {
     "eta_min": [0.00001],
     "tweedie_power": [1.5],
     "tweedie_dispersion": [1.0],
+    "rolled_feedback_max_prob": [0.5],
+    "rolled_feedback_warmup_epochs": [30],
+    "rolled_feedback_ramp_epochs": [100],
+    "autoreg_val_origins": [10],
+    "autoreg_val_stride": [28],
+    "autoreg_val_every": [10],
+    "autoreg_val_mode": ["mean"],
+    "autoreg_val_num_samples": [50],
+    "checkpoint_metric": ["autoreg_wrmsse"],
     "seed": [42],
 }
 
@@ -195,8 +256,46 @@ def main(argv: list[str] | None = None) -> None:
                 "run": artifact_dir.name,
                 **params,
                 **flat_holdout_metrics,
-                "best_internal_val_nll": min(metric["val_loss"] for metric in train_metrics),
+                "best_internal_val_loss": min(metric["val_loss"] for metric in train_metrics),
+                "internal_val_loss_name": params["loss"],
+                "best_selection_score": min(
+                    metric["selection_score"]
+                    for metric in train_metrics
+                    if metric.get("selection_score") is not None
+                ),
+                "selection_metric": params.get("checkpoint_metric", "autoreg_wrmsse"),
+                "best_autoreg_wrmsse": min(
+                    metric.get("autoreg_wrmsse", float("inf")) for metric in train_metrics
+                ),
+                "best_autoreg_rmsse": min(
+                    metric.get("autoreg_rmsse", float("inf")) for metric in train_metrics
+                ),
+                "best_autoreg_spike_day_mae": min(
+                    metric.get("autoreg_spike_day_mae", float("inf")) for metric in train_metrics
+                ),
             }
+
+            # Also capture metrics for rank 2 and 3 if available
+            for rank in [2, 3]:
+                rank_metrics_path = artifact_dir / f"eval_rank_{rank}" / "holdout_metrics_all_modes.json"
+                if rank_metrics_path.exists():
+                    try:
+                        rank_metrics = json.loads(rank_metrics_path.read_text(encoding="utf-8"))
+                        flat_rank_metrics = flatten_holdout_metrics(rank_metrics)
+                        row.update({f"rank{rank}_{k}": v for k, v in flat_rank_metrics.items()})
+                    except Exception:
+                        continue
+
+            # Capture ensemble metrics if available
+            ensemble_metrics_path = artifact_dir / "eval_ensemble" / "holdout_metrics_all_modes.json"
+            if ensemble_metrics_path.exists():
+                try:
+                    ensemble_metrics = json.loads(ensemble_metrics_path.read_text(encoding="utf-8"))
+                    flat_ensemble_metrics = flatten_holdout_metrics(ensemble_metrics)
+                    row.update({f"ensemble_{k}": v for k, v in flat_ensemble_metrics.items()})
+                except Exception:
+                    pass
+
             summary_rows.append(row)
             summary_path = output_dir / f"summary_{sweep_timestamp}.csv"
             pd.DataFrame(summary_rows).to_csv(summary_path, index=False)

@@ -215,9 +215,11 @@ Training writes to `artifacts/deepar_m5/` by default:
 
 | Artifact | Purpose |
 |---|---|
-| `best.pt` | Best checkpoint by validation loss. |
+| `best.pt` | Best checkpoint by the configured selection metric. Sweep defaults use rolling-origin autoregressive WRMSSE. |
 | `latest.pt` | Most recent checkpoint. |
-| `metrics.json` | Per-epoch train and validation losses. |
+| `metrics.json` | Per-epoch train loss, teacher-forced validation loss, and available autoregressive metrics. |
+| `rolling_validation_metrics.json` | Most recent per-origin autoregressive validation metrics. |
+| `best_rolling_validation_metrics.json` | Per-origin autoregressive metrics that produced `best.pt`. |
 | `data_config.json` | Data/window settings used for training. |
 | `model_config.json` | Model shape settings. |
 | `encoders.json` | Static categorical id mappings. |

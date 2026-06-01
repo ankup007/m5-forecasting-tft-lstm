@@ -12,6 +12,7 @@ import pandas as pd
 
 STATIC_COLUMNS = ["item_id", "dept_id", "cat_id", "store_id", "state_id"]
 EVENT_COLUMNS = ["event_name_1", "event_type_1"]
+DEFAULT_PRIOR_HISTORY_LENGTH = 28
 logger = logging.getLogger(__name__)
 
 
@@ -23,6 +24,7 @@ class DataConfig:
     subset_size: int | None = 1000
     context_length: int = 56
     prediction_length: int = 28
+    prior_history_length: int = DEFAULT_PRIOR_HISTORY_LENGTH
     seed: int = 42
     sales_file: str = "sales_train_evaluation.csv"
     use_event_embeddings: bool = True
@@ -43,6 +45,8 @@ class M5Bundle:
     covariate_columns: list[str]
     event_encoders: dict[str, dict[str, int]] | None = None
     zero_counts: np.ndarray | None = None
+    zero_counts_valid_end: int | None = None
+    prior_history_length: int = DEFAULT_PRIOR_HISTORY_LENGTH
 
     @property
     def num_series(self) -> int:
@@ -149,16 +153,32 @@ def select_series(frame: pd.DataFrame, subset_size: int | None, seed: int) -> pd
     rng = np.random.default_rng(seed)
     groups = list(frame.groupby(["cat_id", "store_id"], sort=True))
     per_group = max(1, subset_size // max(1, len(groups)))
-    logger.debug("Found %s cat_id/store_id groups; sampling up to %s per group", len(groups), per_group)
+    logger.debug("Found %s cat_id/store_id groups; base sampling up to %s per group", len(groups), per_group)
     selected_indices: list[int] = []
+    group_indices: list[np.ndarray] = []
 
     for _, group in groups:
-        take = min(len(group), per_group)
-        selected_indices.extend(rng.choice(group.index.to_numpy(), size=take, replace=False).tolist())
+        indices = group.index.to_numpy()
+        group_indices.append(indices)
+        take = min(len(indices), per_group)
+        selected_indices.extend(rng.choice(indices, size=take, replace=False).tolist())
+
+    selected_set = set(selected_indices)
+    if len(selected_indices) < subset_size:
+        group_order = rng.permutation(len(group_indices))
+        for group_idx in group_order:
+            if len(selected_indices) >= subset_size:
+                break
+            remaining_in_group = np.setdiff1d(group_indices[group_idx], np.fromiter(selected_set, dtype=np.int64), assume_unique=False)
+            if len(remaining_in_group) == 0:
+                continue
+            extra = int(rng.choice(remaining_in_group))
+            selected_indices.append(extra)
+            selected_set.add(extra)
 
     if len(selected_indices) < subset_size:
         logger.debug("Selected %s rows from balanced groups; filling remaining rows randomly", len(selected_indices))
-        remaining = np.setdiff1d(frame.index.to_numpy(), np.array(selected_indices, dtype=np.int64))
+        remaining = np.setdiff1d(frame.index.to_numpy(), np.fromiter(selected_set, dtype=np.int64))
         take = min(subset_size - len(selected_indices), len(remaining))
         selected_indices.extend(rng.choice(remaining, size=take, replace=False).tolist())
 
@@ -166,9 +186,15 @@ def select_series(frame: pd.DataFrame, subset_size: int | None, seed: int) -> pd
         logger.warning("Requested subset_size=%s but only selected %s rows", subset_size, len(selected_indices))
     elif len(selected_indices) > subset_size:
         logger.debug("Oversampled %s candidate rows before trimming to subset_size=%s", len(selected_indices), subset_size)
+        selected_indices = rng.choice(np.array(selected_indices, dtype=np.int64), size=subset_size, replace=False).tolist()
 
-    selected = frame.loc[selected_indices[:subset_size]].sort_values("id").reset_index(drop=True)
-    logger.info("Selected series frame shape=%s", selected.shape)
+    selected = frame.loc[selected_indices].sort_values("id").reset_index(drop=True)
+    composition = selected.groupby(["cat_id", "store_id"], sort=True).size()
+    logger.info(
+        "Selected series frame shape=%s across %s cat/store groups",
+        selected.shape,
+        len(composition),
+    )
     return selected
 
 
@@ -228,14 +254,11 @@ def _common_calendar_covariates(
             encoded = calendar[col].fillna("__NONE__").map(mapping).fillna(0).astype(np.float32).to_numpy()
             cat_list.append(encoded)
             cat_names.append(f"{col}_id")
-    else:
-        # Fallback to zeros/placeholders if no encoders
-        for col in EVENT_COLUMNS:
-            cat_list.append(np.zeros_like(wday))
-            cat_names.append(f"{col}_id")
-
     continuous_covariates = np.stack(cont_list, axis=1).astype(np.float32)
-    categorical_covariates = np.stack(cat_list, axis=1).astype(np.float32)
+    if cat_list:
+        categorical_covariates = np.stack(cat_list, axis=1).astype(np.float32)
+    else:
+        categorical_covariates = np.zeros((len(calendar), 0), dtype=np.float32)
     
     return continuous_covariates, cont_names, categorical_covariates, cat_names
 
@@ -257,55 +280,54 @@ def _build_price_covariates(
     num_series = len(sales_frame)
     num_days = len(calendar)
 
-    # 1. Pre-calculate department means per week
-    # We need item_id -> dept_id mapping
+    # 1. Pre-calculate department means per week.
     item_dept_map = sales_frame[["item_id", "dept_id"]].drop_duplicates()
     prices_with_dept = prices.merge(item_dept_map, on="item_id", how="inner")
-    dept_week_means = prices_with_dept.groupby(["dept_id", "wm_yr_wk"])["sell_price"].mean().to_dict()
+    dept_week_means = prices_with_dept.pivot_table(
+        index="dept_id",
+        columns="wm_yr_wk",
+        values="sell_price",
+        aggfunc="mean",
+    )
 
     # 2. Filter prices to only selected series
     selected_keys = sales_frame[["store_id", "item_id"]].drop_duplicates()
     prices = prices.merge(selected_keys, on=["store_id", "item_id"], how="inner")
-    
-    price_groups = {
-        key: group[["wm_yr_wk", "sell_price"]].to_numpy()
-        for key, group in prices.groupby(["store_id", "item_id"], sort=False)
-    }
+    weekly_prices = prices.pivot_table(
+        index=["store_id", "item_id"],
+        columns="wm_yr_wk",
+        values="sell_price",
+        aggfunc="first",
+    )
 
-    log_prices = np.zeros((num_series, num_days), dtype=np.float32)
-    missing = np.ones_like(log_prices, dtype=np.float32)
-    rel_max = np.zeros_like(log_prices, dtype=np.float32)
-    rel_dept = np.zeros_like(log_prices, dtype=np.float32)
+    series_index = pd.MultiIndex.from_frame(sales_frame[["store_id", "item_id"]])
+    daily = weekly_prices.reindex(series_index).reindex(columns=calendar_weeks).to_numpy(dtype=np.float32)
 
-    for row_idx, row in enumerate(sales_frame.itertuples(index=False)):
-        key = (row.store_id, row.item_id)
-        dept = row.dept_id
-        weekly_rows = price_groups.get(key)
-        
-        if weekly_rows is None or len(weekly_rows) == 0:
-            continue
-            
-        weekly_map = {int(week): float(price) for week, price in weekly_rows}
-        daily = np.array([weekly_map.get(int(week), np.nan) for week in calendar_weeks], dtype=np.float32)
-        
-        valid = np.isfinite(daily)
-        missing[row_idx] = (~valid).astype(np.float32)
-        
-        fill_value = float(np.nanmedian(daily)) if valid.any() else 0.0
-        daily = np.where(valid, daily, fill_value)
-        
-        # log1p price
-        log_prices[row_idx] = np.log1p(np.maximum(daily, 0.0))
-        
-        # relative to max
-        m_val = daily.max()
-        if m_val > 0:
-            rel_max[row_idx] = (daily / m_val) - 0.5 # Center roughly
-            
-        # relative to department mean
-        dept_means = np.array([dept_week_means.get((dept, int(week)), daily_p) for week, daily_p in zip(calendar_weeks, daily)], dtype=np.float32)
-        valid_dept = dept_means > 0
-        rel_dept[row_idx] = np.where(valid_dept, (daily / dept_means) - 1.0, 0.0)
+    missing = (~np.isfinite(daily)).astype(np.float32)
+    valid = np.isfinite(daily)
+    fill_values = np.zeros(num_series, dtype=np.float32)
+    rows_with_prices = valid.any(axis=1)
+    fill_values[rows_with_prices] = np.nanmedian(daily[rows_with_prices], axis=1).astype(np.float32)
+    daily = np.where(valid, daily, fill_values[:, None])
+
+    log_prices = np.log1p(np.maximum(daily, 0.0)).astype(np.float32)
+    max_price = daily.max(axis=1, keepdims=True)
+    rel_max = np.divide(
+        daily,
+        max_price,
+        out=np.zeros_like(daily, dtype=np.float32),
+        where=max_price > 0,
+    ) - np.where(max_price > 0, 0.5, 0.0)
+
+    dept_ids = sales_frame["dept_id"].to_numpy()
+    dept_daily = dept_week_means.reindex(dept_ids).reindex(columns=calendar_weeks).to_numpy(dtype=np.float32)
+    dept_daily = np.where(np.isfinite(dept_daily), dept_daily, daily)
+    rel_dept = np.divide(
+        daily,
+        dept_daily,
+        out=np.zeros_like(daily, dtype=np.float32),
+        where=dept_daily > 0,
+    ) - np.where(dept_daily > 0, 1.0, 0.0)
 
     covs = np.stack([log_prices, missing, rel_max, rel_dept], axis=2)
     names = ["log_sell_price", "price_missing", "relative_price_max", "relative_price_dept"]
@@ -314,25 +336,27 @@ def _build_price_covariates(
     return covs, names
 
 
-def _calculate_zero_counts(values: np.ndarray) -> np.ndarray:
+def _calculate_zero_counts(values: np.ndarray, valid_end: int | None = None) -> np.ndarray:
     """Pre-calculate continuous zero-sale days for each series and day.
     
-    Result is a matrix of same shape as values, where each element is 
-    the number of consecutive zero sales up to (but not including) that day.
+    Result is shaped ``series x (days + 1)`` so index ``j`` contains the
+    number of consecutive zero sales up to, but not including, day ``j``.
+    When ``valid_end`` is supplied, only observations before that boundary are
+    used; later positions are left as NaN so accidental future reads are visible.
     """
     
     num_series, num_days = values.shape
-    zero_counts = np.zeros((num_series, num_days + 1), dtype=np.float32)
-    
-    for i in range(num_series):
-        count = 0.0
-        for j in range(num_days):
-            zero_counts[i, j] = count
-            if values[i, j] == 0:
-                count += 1.0
-            else:
-                count = 0.0
-        zero_counts[i, num_days] = count
+    if valid_end is None:
+        valid_end = num_days
+    valid_end = int(np.clip(valid_end, 0, num_days))
+
+    zero_counts = np.full((num_series, num_days + 1), np.nan, dtype=np.float32)
+
+    count = np.zeros(num_series, dtype=np.float32)
+    for day_idx in range(valid_end):
+        zero_counts[:, day_idx] = count
+        count = np.where(values[:, day_idx] == 0.0, count + 1.0, 0.0)
+    zero_counts[:, valid_end] = count
         
     return zero_counts
 
@@ -481,25 +505,31 @@ def load_m5_bundle(
     scales = _series_scales(sales_values, train_end=train_end)
     static_cats = encode_static(sales, encoders)
     
-    # Pre-calculate zero counts (anchor states)
-    zero_counts = _calculate_zero_counts(sales_values)
+    # Pre-calculate zero counts from training history only; later positions stay
+    # invalid so holdout-derived zero-run state cannot be consumed accidentally.
+    zero_counts = _calculate_zero_counts(sales_values, valid_end=train_end)
 
     if load_covariates:
-        # 1. Base covariates strictly ordered: [Continuous (15), Categorical (2)]
+        # 1. Base covariates strictly ordered: [Continuous (15), Categorical (0 or 2)]
         covariates, covariate_columns = _build_covariate_cube(sales, calendar, prices, event_encoders)
         num_cat = len(event_encoders) if event_encoders else 0
         
         # 2. Extract 28-day lags (Continuous)
         lag_covs, lag_names = _calculate_lags(sales_values, scales, calendar.shape[0])
         
-        # 3. Final Concatenation strictly ordered: [Continuous (15), Lag (1), Categorical (2)]
+        # 3. Final Concatenation strictly ordered: [Continuous (15), Lag (1), Categorical (0 or 2)]
         # This keeps all continuous features in a single block at the beginning
-        cont_block = covariates[:, :, :-num_cat] if num_cat > 0 else covariates
-        cat_block = covariates[:, :, -num_cat:] if num_cat > 0 else np.zeros((bundle.num_series, calendar.shape[0], 0))
-        
+        if num_cat > 0:
+            cont_block = covariates[:, :, :-num_cat]
+            cat_block = covariates[:, :, -num_cat:]
+            final_names = covariate_columns[:-num_cat] + lag_names + covariate_columns[-num_cat:]
+        else:
+            cont_block = covariates
+            cat_block = np.zeros((sales.shape[0], calendar.shape[0], 0), dtype=np.float32)
+            final_names = covariate_columns + lag_names
+
         final_covs = np.concatenate([cont_block, lag_covs, cat_block], axis=2)
-        final_names = covariate_columns[:-num_cat] + lag_names + covariate_columns[-num_cat:] if num_cat > 0 else covariate_columns + lag_names
-        
+
         covariates = final_covs
         covariate_columns = final_names
     else:
@@ -518,6 +548,8 @@ def load_m5_bundle(
         covariate_columns=covariate_columns,
         event_encoders=event_encoders,
         zero_counts=zero_counts,
+        zero_counts_valid_end=train_end,
+        prior_history_length=config.prior_history_length,
     )
 
 
@@ -537,6 +569,7 @@ class WindowSampler:
         self.context_length = context_length
         self.prediction_length = prediction_length
         self.sequence_length = context_length + prediction_length
+        self.prior_history_length = int(bundle_prior_history_length(bundle))
         self.rng = np.random.default_rng(seed)
         self.train_end = bundle.known_days - prediction_length
         self._logged_train_batch = False
@@ -558,12 +591,12 @@ class WindowSampler:
         """Sample random rolling windows from the training portion of the data.
 
         Each row in the returned batch independently picks a series and a start
-        day before the validation cutoff, then extracts
+        day from the full observed history, then extracts
         ``context_length + prediction_length`` aligned target/covariate values.
         """
 
         series_idx = self.rng.integers(0, self.bundle.num_series, size=batch_size)
-        max_start = self.train_end - self.sequence_length
+        max_start = self.bundle.known_days - self.sequence_length
         starts = self.rng.integers(0, max_start + 1, size=batch_size)
         batch = self._make_batch(series_idx, starts)
         if not self._logged_train_batch:
@@ -605,14 +638,34 @@ class WindowSampler:
         model uses known covariates for the full context-plus-horizon window.
         """
 
-        forecast_start = self.bundle.known_days
+        return self.make_prediction_batch(series_idx, forecast_start=self.bundle.known_days)
+
+    def make_prediction_batch(self, series_idx: np.ndarray, forecast_start: int) -> dict[str, np.ndarray]:
+        """Build an autoregressive prediction window at an arbitrary forecast origin.
+
+        ``forecast_start`` is the first decoded day. Context targets before that
+        origin are real observations; future target slots are zeros so callers
+        can use this both for historical rolling-origin validation and final
+        inference without exposing future actuals to the decoder.
+        """
+
+        forecast_start = int(forecast_start)
         start = forecast_start - self.context_length
+        if start < 0:
+            raise ValueError(
+                f"forecast_start={forecast_start} is too early for context_length={self.context_length}."
+            )
         positions = start + np.arange(self.sequence_length)
+        if positions[-1] >= self.bundle.covariates.shape[1]:
+            raise ValueError(
+                f"Prediction window ending at position {int(positions[-1])} exceeds "
+                f"available covariates ({self.bundle.covariates.shape[1]} days)."
+            )
         targets = np.zeros((len(series_idx), self.sequence_length), dtype=np.float32)
         targets[:, : self.context_length] = self.bundle.sales_values[series_idx, start:forecast_start]
 
-        # Extract 28 days of history before the window starts (prior_history)
-        history_len = 28
+        # Extract the recurrent rolling-history buffer before the window starts.
+        history_len = self.prior_history_length
         prior_history = np.zeros((len(series_idx), history_len), dtype=np.float32)
         for i, idx in enumerate(series_idx):
             h_start = max(0, start - history_len)
@@ -622,6 +675,13 @@ class WindowSampler:
 
         initial_zero_counter = np.zeros((len(series_idx),), dtype=np.float32)
         if self.bundle.zero_counts is not None:
+            zero_counts_valid_end = getattr(self.bundle, "zero_counts_valid_end", None)
+            if zero_counts_valid_end is not None and start > zero_counts_valid_end:
+                raise ValueError(
+                    f"Inference window starts at {start}, beyond zero-count valid boundary "
+                    f"{zero_counts_valid_end}. Increase context_length or recompute zero counts "
+                    "from data that is valid for this forecast origin."
+                )
             initial_zero_counter = self.bundle.zero_counts[series_idx, start]
 
         batch = {
@@ -658,8 +718,8 @@ class WindowSampler:
         positions = starts[:, None] + offsets[None, :]
         targets = self.bundle.sales_values[series_idx[:, None], positions]
 
-        # Extract 28 days of history before the window starts (prior_history)
-        history_len = 28
+        # Extract the recurrent rolling-history buffer before the window starts.
+        history_len = self.prior_history_length
         prior_history = np.zeros((len(series_idx), history_len), dtype=np.float32)
         for i, (s_idx, start) in enumerate(zip(series_idx, starts)):
             h_start = max(0, start - history_len)
@@ -669,6 +729,12 @@ class WindowSampler:
 
         initial_zero_counter = np.zeros((len(series_idx),), dtype=np.float32)
         if self.bundle.zero_counts is not None:
+            zero_counts_valid_end = getattr(self.bundle, "zero_counts_valid_end", None)
+            if zero_counts_valid_end is not None and np.any(starts > zero_counts_valid_end):
+                raise ValueError(
+                    "Training window starts beyond the zero-count valid boundary "
+                    f"{zero_counts_valid_end}."
+                )
             initial_zero_counter = self.bundle.zero_counts[series_idx, starts]
 
         loss_mask = np.zeros_like(targets, dtype=np.float32)
@@ -704,3 +770,9 @@ def config_to_dict(config: DataConfig) -> dict:
     """Convert a data config dataclass to a serializable dictionary."""
 
     return asdict(config)
+
+
+def bundle_prior_history_length(bundle: M5Bundle) -> int:
+    """Return the prior-history length saved on newer bundles, or the default."""
+
+    return int(getattr(bundle, "prior_history_length", DEFAULT_PRIOR_HISTORY_LENGTH))

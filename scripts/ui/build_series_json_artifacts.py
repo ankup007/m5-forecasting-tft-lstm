@@ -35,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="artifacts/deepar_m5_experiments",
         help="Root experiment directory used when searching for the latest run.",
     )
+    parser.add_argument(
+        "--eval-subdir",
+        default=None,
+        help="Subdirectory within run_dir containing evaluation CSVs (e.g. eval_ensemble).",
+    )
     return parser
 
 
@@ -65,6 +70,31 @@ def load_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(path)
     return pd.read_csv(path)
+
+
+def find_day_columns(columns: list[str] | pd.Index) -> list[str]:
+    return [col for col in columns if col.startswith("d_") and col[2:].isdigit()]
+
+
+def load_pre_holdout_actuals(
+    data_dir: Path,
+    sales_file: str,
+    selected_ids: list[str],
+    prediction_length: int,
+) -> tuple[pd.DataFrame, list[str]]:
+    sales_path = data_dir / sales_file
+    if not sales_path.exists():
+        sales_path = data_dir / "sales_train_validation.csv"
+    header = pd.read_csv(sales_path, nrows=0)
+    day_columns = find_day_columns(header.columns)
+    if len(day_columns) < prediction_length:
+        raise ValueError(
+            f"Expected at least {prediction_length} day columns in {sales_path}, found {len(day_columns)}."
+        )
+    pre_holdout_columns = day_columns[-prediction_length:]
+    frame = pd.read_csv(sales_path, usecols=["id", *pre_holdout_columns])
+    frame = frame.set_index("id").reindex(selected_ids).reset_index()
+    return frame, pre_holdout_columns
 
 
 def find_latest_run(root: Path) -> Path:
@@ -129,18 +159,26 @@ def main() -> None:
     if not run_dir.exists():
         raise FileNotFoundError(run_dir)
 
+    # Path where evaluation CSVs are located
+    eval_path = run_dir / args.eval_subdir if args.eval_subdir else run_dir
+
     # Validate that we have at least one forecast file
-    series_raw_path = run_dir / "holdout_forecasts_mean.csv"
+    series_raw_path = eval_path / "holdout_forecasts_mean.csv"
     if not series_raw_path.exists():
         # Try any mode if mean is missing
-        fallback = list(run_dir.glob("holdout_forecasts_*.csv"))
+        fallback = list(eval_path.glob("holdout_forecasts_*.csv"))
         if not fallback:
             raise FileNotFoundError(
-                f"No forecast CSVs found in {run_dir}. Run the experiment with holdout evaluation first."
+                f"No forecast CSVs found in {eval_path}. Run the experiment with holdout evaluation first."
             )
         series_raw_path = fallback[0]
 
     output_dir = Path(args.output_dir) if args.output_dir else run_dir / "series_json"
+    if args.eval_subdir:
+        # If we are processing a specific evaluation, put it in a separate subfolder 
+        # so we can keep Rank 1, 2, 3 and Ensemble artifacts distinct if needed.
+        output_dir = output_dir.parent / f"series_json_{args.eval_subdir}"
+        
     series_dir = output_dir / "series"
     series_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,7 +196,18 @@ def main() -> None:
                 if "run" in df.columns:
                     matches = df.loc[df["run"].astype(str) == run_dir.name]
                     if not matches.empty:
-                        summary_row = matches.iloc[0]
+                        row = matches.iloc[0].copy()
+                        # If we are in an ensemble/rank eval, we need to extract those specific metrics
+                        # and move them to the "standard" keys so build_nested_aggregate_metrics works.
+                        if args.eval_subdir:
+                            prefix = args.eval_subdir.replace("eval_", "") # ensemble or rank_2
+                            # Replace standard metrics with the ones from this rank
+                            for col in row.index:
+                                if col.startswith(f"{prefix}_"):
+                                    original_key = col[len(prefix)+1:]
+                                    row[original_key] = row[col]
+                        
+                        summary_row = row
                         summary_file = sf
                         break
             except Exception:
@@ -174,23 +223,48 @@ def main() -> None:
     mode_frames: dict[str, dict[str, pd.DataFrame]] = {}
     available_modes: list[str] = []
     for mode in MODE_ORDER:
-        raw_path = run_dir / f"holdout_forecasts_{mode}.csv"
+        raw_path = eval_path / f"holdout_forecasts_{mode}.csv"
         if not raw_path.exists():
             continue
         mode_frames[mode] = {"raw": load_csv(raw_path)}
         available_modes.append(mode)
-        rounded_path = run_dir / f"holdout_forecasts_{mode}_rounded.csv"
+        rounded_path = eval_path / f"holdout_forecasts_{mode}_rounded.csv"
         if rounded_path.exists():
             mode_frames[mode]["rounded"] = load_csv(rounded_path)
 
     if not available_modes:
-        raise FileNotFoundError(f"No holdout forecast files found under {run_dir}")
+        raise FileNotFoundError(f"No holdout forecast files found under {eval_path}")
 
     base_frame = mode_frames[available_modes[0]]["raw"]
     base_lookup = base_frame.set_index(base_frame["id"].astype(str))
     series_ids = base_lookup.index.astype(str).tolist()
     horizon = list(range(1, len(get_forecast_columns(base_frame)) + 1))
     actual_columns = get_actual_columns(base_frame)
+
+    # Load wrmsse.json if it exists in the evaluation subdir
+    wrmsse_path = eval_path / "holdout_metrics_all_modes.json"
+    if wrmsse_path.exists():
+        # Copy to the output directory as wrmsse.json for the UI
+        try:
+            metrics = json.loads(wrmsse_path.read_text(encoding="utf-8"))
+            (output_dir / "wrmsse.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: Failed to process WRMSSE metrics: {e}")
+
+    run_config_path = run_dir / "run_config.json"
+    data_dir = Path("m5-forecasting-accuracy")
+    sales_file = "sales_train_validation.csv"
+    if run_config_path.exists():
+        run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
+        data_dir = Path(run_config.get("data_dir", data_dir))
+        sales_file = str(run_config.get("sales_file", sales_file))
+    pre_holdout_frame, pre_holdout_columns = load_pre_holdout_actuals(
+        data_dir,
+        sales_file,
+        series_ids,
+        len(actual_columns),
+    )
+    pre_holdout_lookup = pre_holdout_frame.set_index(pre_holdout_frame["id"].astype(str))
     mode_lookups: dict[str, dict[str, pd.DataFrame]] = {
         mode: {variant: frame.set_index(frame["id"].astype(str)) for variant, frame in variant_frames.items()}
         for mode, variant_frames in mode_frames.items()
@@ -234,6 +308,11 @@ def main() -> None:
             "run": run_dir.name,
             "horizon": horizon,
             "actuals": [json_safe(v) for v in base_row[actual_columns].tolist()],
+            "pre_holdout_actuals": [
+                json_safe(v)
+                for v in pre_holdout_lookup.loc[series_id][pre_holdout_columns].tolist()
+            ],
+            "pre_holdout_horizon": list(range(1, len(pre_holdout_columns) + 1)),
             "modes": {},
         }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -15,6 +16,7 @@ from .model import DeepAR
 
 
 logger = logging.getLogger(__name__)
+_WRMSSE_CONTEXT_CACHE: dict[tuple, tuple[list[tuple[np.ndarray | None, int | None]], dict[int, "WRMSSEContext"]]] = {}
 
 
 def forecast_multi_summaries(
@@ -80,6 +82,8 @@ def forecast_multi_summaries(
                 initial_zero_counter=batch["initial_zero_counter"],
             )
             samples = samples.clamp_min(0.0)
+            if samples.shape != (num_samples, len(series_idx), data_config.prediction_length):
+                raise ValueError(f"Unexpected sample forecast shape: {tuple(samples.shape)}")
             
             # 3. Derive stochastic summaries from the same samples
             results["sample-mean"][series_idx] = samples.mean(dim=0).cpu().numpy()
@@ -145,6 +149,8 @@ def forecast_selected_series(
                     prior_history=batch["prior_history"],
                     initial_zero_counter=batch["initial_zero_counter"],
                 )
+                if samples.shape != (num_samples, len(series_idx), data_config.prediction_length):
+                    raise ValueError(f"Unexpected sample forecast shape: {tuple(samples.shape)}")
                 pred = samples.mean(dim=0) if forecast_mode == "sample-mean" else torch.quantile(samples, quantile, dim=0)
         predictions[series_idx] = pred.clamp_min(0.0).cpu().numpy()
 
@@ -163,8 +169,8 @@ def load_holdout_actuals(
     train_day_columns = find_day_columns(train_header.columns)
     holdout_start_day = day_number(train_day_columns[-1]) + 1
     holdout_end_day = holdout_start_day + prediction_length - 1
-    evaluation = pd.read_csv(data_dir / "sales_train_evaluation.csv")
-    day_columns = find_day_columns(evaluation.columns)
+    evaluation_header = pd.read_csv(data_dir / "sales_train_evaluation.csv", nrows=0)
+    day_columns = find_day_columns(evaluation_header.columns)
     holdout_columns = [
         column
         for column in day_columns
@@ -175,6 +181,7 @@ def load_holdout_actuals(
             f"Expected {prediction_length} holdout columns from d_{holdout_start_day} "
             f"to d_{holdout_end_day}, found {len(holdout_columns)}."
         )
+    evaluation = pd.read_csv(data_dir / "sales_train_evaluation.csv", usecols=["id", *holdout_columns])
     evaluation = evaluation.set_index("id")
     actuals = []
     for series_id in selected_ids:
@@ -212,29 +219,46 @@ def rmsse_denominators(train_values: np.ndarray) -> np.ndarray:
     return np.clip(np.array(denoms), 1e-12, None)
 
 
+LEVEL_GROUPS = [
+    [],  # Level 1: Total
+    ["state_id"],  # Level 2
+    ["store_id"],  # Level 3
+    ["cat_id"],  # Level 4
+    ["dept_id"],  # Level 5
+    ["state_id", "cat_id"],  # Level 6
+    ["state_id", "dept_id"],  # Level 7
+    ["store_id", "cat_id"],  # Level 8
+    ["store_id", "dept_id"],  # Level 9
+    ["item_id"],  # Level 10
+    ["item_id", "state_id"],  # Level 11
+    ["item_id", "store_id"],  # Level 12 (bottom)
+]
+
+
+def _build_level_indices(sales_frame: pd.DataFrame) -> list[tuple[np.ndarray | None, int | None]]:
+    """Precompute row-to-aggregate mappings for all M5 hierarchy levels."""
+
+    level_indices: list[tuple[np.ndarray | None, int | None]] = []
+    for level_cols in LEVEL_GROUPS:
+        if not level_cols or level_cols == ["item_id", "store_id"]:
+            level_indices.append((None, None))
+            continue
+        codes = sales_frame.groupby(level_cols, sort=True).ngroup().to_numpy(dtype=np.int64)
+        level_indices.append((codes, int(codes.max()) + 1 if len(codes) else 0))
+    return level_indices
+
+
 def _aggregate_to_levels(
     values: np.ndarray,
     sales_frame: pd.DataFrame,
+    level_indices: list[tuple[np.ndarray | None, int | None]] | None = None,
 ) -> list[np.ndarray]:
     """Aggregate bottom-level series (Level 12) up to all 12 hierarchical levels."""
 
-    levels = [
-        [],  # Level 1: Total
-        ["state_id"],  # Level 2
-        ["store_id"],  # Level 3
-        ["cat_id"],  # Level 4
-        ["dept_id"],  # Level 5
-        ["state_id", "cat_id"],  # Level 6
-        ["state_id", "dept_id"],  # Level 7
-        ["store_id", "cat_id"],  # Level 8
-        ["store_id", "dept_id"],  # Level 9
-        ["item_id"],  # Level 10
-        ["item_id", "state_id"],  # Level 11
-        ["item_id", "store_id"],  # Level 12 (bottom)
-    ]
-
+    if level_indices is None:
+        level_indices = _build_level_indices(sales_frame)
     aggregated = []
-    for level_cols in levels:
+    for level_idx, level_cols in enumerate(LEVEL_GROUPS):
         if not level_cols:
             # Level 1: Sum everything into a single series
             aggregated.append(values.sum(axis=0, keepdims=True))
@@ -242,17 +266,136 @@ def _aggregate_to_levels(
             # Level 12: Already at the bottom level
             aggregated.append(values)
         else:
-            # Group and sum based on the specified columns
-            temp_df = sales_frame[level_cols].copy()
-            # Use a dummy column to ensure we can group and sum the numpy array correctly
-            # Actually, it's safer to use pandas grouping directly on the values
-            # We convert values to a temporary DataFrame for easy aggregation
-            val_df = pd.DataFrame(values)
-            combined = pd.concat([temp_df, val_df], axis=1)
-            agg_df = combined.groupby(level_cols, sort=True).sum()
-            aggregated.append(agg_df.to_numpy(dtype=np.float64))
+            codes, group_count = level_indices[level_idx]
+            if codes is None or group_count is None:
+                raise RuntimeError(f"Missing aggregation index for level {level_idx + 1}")
+            agg = np.zeros((group_count, values.shape[1]), dtype=np.float64)
+            np.add.at(agg, codes, values)
+            aggregated.append(agg)
 
     return aggregated
+
+
+@dataclass(frozen=True)
+class WRMSSEContext:
+    """Reusable M5 WRMSSE inputs for one forecast origin."""
+
+    forecast_start: int
+    prediction_length: int
+    denominators: list[np.ndarray]
+    weights: list[np.ndarray]
+
+
+def _daily_revenue_matrix(bundle, data_dir: Path, start: int, end: int) -> np.ndarray:
+    """Return selected-series daily revenue for the requested observed-day slice."""
+
+    calendar = pd.read_csv(data_dir / "calendar.csv", usecols=["d", "wm_yr_wk"]).set_index("d")
+    calendar_weeks = calendar.reindex(bundle.day_columns[start:end])["wm_yr_wk"].to_numpy()
+    prices = pd.read_csv(data_dir / "sell_prices.csv")
+    weekly_prices = prices.pivot_table(
+        index=["store_id", "item_id"],
+        columns="wm_yr_wk",
+        values="sell_price",
+        aggfunc="first",
+    )
+    series_index = pd.MultiIndex.from_frame(bundle.sales_frame[["store_id", "item_id"]])
+    daily_prices = weekly_prices.reindex(series_index).reindex(columns=calendar_weeks).to_numpy(dtype=np.float64)
+    daily_prices = np.nan_to_num(daily_prices, nan=0.0)
+    return bundle.sales_values[:, start:end] * daily_prices
+
+
+def precompute_wrmsse_contexts(
+    bundle,
+    data_dir: Path,
+    prediction_length: int,
+    forecast_starts: Iterable[int],
+) -> tuple[list[tuple[np.ndarray | None, int | None]], dict[int, WRMSSEContext]]:
+    """Precompute hierarchy mappings, scales, and revenue weights by forecast origin."""
+
+    origins = sorted({int(origin) for origin in forecast_starts})
+    if not origins:
+        return _build_level_indices(bundle.sales_frame), {}
+    for origin in origins:
+        if not 0 < origin <= bundle.known_days:
+            raise ValueError(f"WRMSSE forecast origin {origin} must be in [1, {bundle.known_days}].")
+
+    cache_key = (
+        str(data_dir.resolve()),
+        tuple(bundle.sales_frame["id"].astype(str)),
+        tuple(bundle.day_columns),
+        int(prediction_length),
+        tuple(origins),
+    )
+    cached = _WRMSSE_CONTEXT_CACHE.get(cache_key)
+    if cached is not None:
+        logger.info("Reusing cached WRMSSE contexts for forecast origins: %s", origins)
+        return cached
+
+    level_indices = _build_level_indices(bundle.sales_frame)
+    sales_levels = _aggregate_to_levels(bundle.sales_values, bundle.sales_frame, level_indices)
+    revenue_start = min(max(0, origin - prediction_length) for origin in origins)
+    revenue_end = max(origins)
+    daily_revenue = _daily_revenue_matrix(bundle, data_dir, revenue_start, revenue_end)
+    contexts: dict[int, WRMSSEContext] = {}
+
+    for origin in origins:
+        weight_start = max(0, origin - prediction_length)
+        bottom_revenue = daily_revenue[:, weight_start - revenue_start : origin - revenue_start].sum(axis=1)
+        revenue_levels = _aggregate_to_levels(bottom_revenue[:, None], bundle.sales_frame, level_indices)
+        denominators = [rmsse_denominators(values[:, :origin]) for values in sales_levels]
+        weights = []
+        for revenue in revenue_levels:
+            flat_revenue = revenue.reshape(-1)
+            weights.append(flat_revenue / max(float(flat_revenue.sum()), 1e-12))
+        contexts[origin] = WRMSSEContext(
+            forecast_start=origin,
+            prediction_length=prediction_length,
+            denominators=denominators,
+            weights=weights,
+        )
+
+    result = (level_indices, contexts)
+    _WRMSSE_CONTEXT_CACHE[cache_key] = result
+    return result
+
+
+def compute_wrmsse_metrics(
+    predictions: np.ndarray,
+    actuals: np.ndarray,
+    sales_frame: pd.DataFrame,
+    context: WRMSSEContext,
+    level_indices: list[tuple[np.ndarray | None, int | None]],
+) -> dict[str, float]:
+    """Compute competition-style WRMSSE using inputs prepared for one origin."""
+
+    if predictions.shape[1] != context.prediction_length:
+        raise ValueError(
+            f"Expected prediction length {context.prediction_length}, found {predictions.shape[1]}."
+        )
+    pred_levels = _aggregate_to_levels(predictions.astype(np.float64), sales_frame, level_indices)
+    actual_levels = _aggregate_to_levels(actuals.astype(np.float64), sales_frame, level_indices)
+    level_rmsses = []
+    level_wrmsses = []
+
+    for pred, actual, denominator, weight in zip(
+        pred_levels,
+        actual_levels,
+        context.denominators,
+        context.weights,
+    ):
+        mse = np.mean(np.square(pred - actual), axis=1)
+        rmsse = np.sqrt(mse / denominator)
+        level_rmsses.append(float(np.mean(rmsse)))
+        level_wrmsses.append(float(np.sum(weight * rmsse)))
+
+    metrics = {
+        "wrmsse": float(np.mean(level_wrmsses)),
+        "rmsse_l12": level_rmsses[11],
+        "wrmsse_l12": level_wrmsses[11],
+    }
+    for level_idx, value in enumerate(level_wrmsses, start=1):
+        metrics[f"wrmsse_l{level_idx}"] = value
+    return metrics
 
 
 def compute_holdout_metrics(
@@ -263,6 +406,8 @@ def compute_holdout_metrics(
     data_dir: Path,
     prediction_length: int,
     compute_wrmsse: bool = False,
+    wrmsse_context: WRMSSEContext | None = None,
+    wrmsse_level_indices: list[tuple[np.ndarray | None, int | None]] | None = None,
 ) -> dict:
     """Compute holdout metrics for the M5 competition.
 
@@ -297,6 +442,23 @@ def compute_holdout_metrics(
     denom_b = rmsse_denominators(train_values.astype(np.float64))
     series_rmsse = np.sqrt(np.mean(np.square(error_b), axis=1) / denom_b)
 
+    zero_mask = actual_b <= 0.0
+    nonzero_mask = actual_b > 0.0
+    positive_pred_mask = pred_b >= 0.5
+    train_float = train_values.astype(np.float64)
+    nonzero_train = np.where(train_float > 0.0, train_float, np.nan)
+    spike_threshold = np.full(train_float.shape[0], 3.0, dtype=np.float64)
+    has_nonzero_history = np.any(train_float > 0.0, axis=1)
+    if np.any(has_nonzero_history):
+        spike_threshold[has_nonzero_history] = np.nanpercentile(
+            nonzero_train[has_nonzero_history],
+            90,
+            axis=1,
+        )
+    spike_threshold = np.where(np.isfinite(spike_threshold), np.maximum(spike_threshold, 3.0), 3.0)
+    spike_threshold_matrix = np.broadcast_to(spike_threshold[:, None], actual_b.shape)
+    spike_mask = actual_b >= spike_threshold_matrix
+
     metrics = {
         "mae": float(abs_error_b.mean()),
         "rmse": float(np.sqrt(np.mean(np.square(error_b)))),
@@ -304,65 +466,38 @@ def compute_holdout_metrics(
         "smape": float(np.mean(smape_values_b)),
         "mape": float(np.nanmean(series_mape)) if np.any(~np.isnan(series_mape)) else float("nan"),
         "rmsse": float(np.mean(series_rmsse)),
+        "zero_day_mae": float(abs_error_b[zero_mask].mean()) if np.any(zero_mask) else float("nan"),
+        "nonzero_day_mae": float(abs_error_b[nonzero_mask].mean()) if np.any(nonzero_mask) else float("nan"),
+        "zero_false_positive_rate": float(positive_pred_mask[zero_mask].mean()) if np.any(zero_mask) else float("nan"),
+        "nonzero_pred_positive_rate": float(positive_pred_mask[nonzero_mask].mean()) if np.any(nonzero_mask) else float("nan"),
+        "spike_day_mae": float(abs_error_b[spike_mask].mean()) if np.any(spike_mask) else float("nan"),
+        "spike_hit_rate": float((pred_b[spike_mask] >= spike_threshold_matrix[spike_mask]).mean()) if np.any(spike_mask) else float("nan"),
+        "spike_bias": float(error_b[spike_mask].mean()) if np.any(spike_mask) else float("nan"),
+        "num_zero_days": int(zero_mask.sum()),
+        "num_nonzero_days": int(nonzero_mask.sum()),
+        "num_spike_days": int(spike_mask.sum()),
         "num_series": int(pred_b.shape[0]),
         "prediction_length": int(pred_b.shape[1]),
     }
 
     if compute_wrmsse:
-        # 1. Aggregate unit sales to all 12 levels
-        pred_levels = _aggregate_to_levels(predictions.astype(np.float64), bundle.sales_frame)
-        actual_levels = _aggregate_to_levels(actuals.astype(np.float64), bundle.sales_frame)
-        train_levels = _aggregate_to_levels(train_values.astype(np.float64), bundle.sales_frame)
-
-        # 2. Compute Revenue for each bottom-level series (Level 12)
-        day_columns = bundle.day_columns[-prediction_length:]
-        sales = bundle.sales_frame[["item_id", "store_id", *day_columns]].copy()
-        long_sales = sales.melt(
-            id_vars=["item_id", "store_id"],
-            value_vars=day_columns,
-            var_name="d",
-            value_name="units",
+        if wrmsse_context is None or wrmsse_level_indices is None:
+            wrmsse_level_indices, contexts = precompute_wrmsse_contexts(
+                bundle,
+                data_dir,
+                prediction_length,
+                [bundle.known_days],
+            )
+            wrmsse_context = contexts[bundle.known_days]
+        metrics.update(
+            compute_wrmsse_metrics(
+                predictions,
+                actuals,
+                bundle.sales_frame,
+                wrmsse_context,
+                wrmsse_level_indices,
+            )
         )
-        calendar = pd.read_csv(data_dir / "calendar.csv", usecols=["d", "wm_yr_wk"])
-        prices = pd.read_csv(data_dir / "sell_prices.csv")
-        long_sales = long_sales.merge(calendar, on="d", how="left")
-        long_sales = long_sales.merge(prices, on=["store_id", "item_id", "wm_yr_wk"], how="left")
-        long_sales["sell_price"] = long_sales["sell_price"].fillna(0.0)
-        long_sales["revenue"] = long_sales["units"].astype(float) * long_sales["sell_price"].astype(float)
-
-        bottom_revenue = long_sales.groupby(["item_id", "store_id"], sort=True)["revenue"].sum()
-
-        row_revenue = []
-        rev_per_item_store = bottom_revenue.to_dict()
-        for row in bundle.sales_frame.itertuples():
-            row_revenue.append(rev_per_item_store.get((row.item_id, row.store_id), 0.0))
-        row_revenue = np.array(row_revenue, dtype=np.float64)
-
-        # 3. Aggregate revenue to all levels and compute weights
-        revenue_levels = _aggregate_to_levels(row_revenue[:, None], bundle.sales_frame)
-
-        level_rmsses = []
-        level_wrmsses = []
-
-        for l_idx in range(12):
-            p = pred_levels[l_idx]
-            a = actual_levels[l_idx]
-            t = train_levels[l_idx]
-            r = revenue_levels[l_idx].flatten()
-
-            w = r / np.sum(r).clip(min=1e-12)
-            mse = np.mean(np.square(p - a), axis=1)
-            denom = rmsse_denominators(t)
-            rmsse = np.sqrt(mse / denom)
-
-            level_rmsses.append(float(np.mean(rmsse)))
-            level_wrmsses.append(float(np.sum(w * rmsse)))
-
-        metrics["wrmsse"] = float(np.mean(level_wrmsses))
-        metrics["rmsse_l12"] = level_rmsses[11]
-        metrics["wrmsse_l12"] = level_wrmsses[11]
-        for i, val in enumerate(level_wrmsses):
-            metrics[f"wrmsse_l{i+1}"] = val
 
     # Per-series breakdown for saving to CSV
     series_metrics = pd.DataFrame({

@@ -396,6 +396,9 @@ def main() -> None:
             "source_run": run_dir.name,
             "horizon": horizon,
             "actuals": [float(v) for v in actuals[idx].tolist()],
+            "pre_holdout_actuals": [
+                float(v) for v in bundle.sales_values[idx, -data_config.prediction_length :].tolist()
+            ],
             "baselines": {
                 "naive": {
                     "forecast": [float(v) for v in naive[idx].tolist()],

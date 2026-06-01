@@ -14,8 +14,8 @@ sys.path.insert(0, str(ROOT / "src"))
 import numpy as np
 import pandas as pd
 
-from deepar_m5.data import DataConfig, load_m5_bundle, save_json
-from deepar_m5.evaluation import compute_holdout_metrics, load_holdout_actuals
+from deepar_m5.data import DataConfig, load_m5_bundle
+from deepar_m5.evaluation import compute_holdout_metrics, load_holdout_actuals, precompute_wrmsse_contexts
 from deepar_m5.utils import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -67,9 +67,18 @@ def main():
         selected_ids, 
         data_config.prediction_length
     )
+    wrmsse_level_indices, wrmsse_contexts = precompute_wrmsse_contexts(
+        bundle,
+        Path(args.data_dir),
+        data_config.prediction_length,
+        [bundle.known_days],
+    )
+    wrmsse_context = wrmsse_contexts[bundle.known_days]
 
     # 3. Find and process forecast CSVs
     forecast_files = list(run_dir.glob("holdout_forecasts_*.csv"))
+    if not forecast_files:
+        raise FileNotFoundError(f"No holdout_forecasts_*.csv files found under {run_dir}")
     wrmsse_results = {}
 
     for fpath in forecast_files:
@@ -97,6 +106,8 @@ def main():
             Path(args.data_dir),
             data_config.prediction_length,
             compute_wrmsse=True,
+            wrmsse_context=wrmsse_context,
+            wrmsse_level_indices=wrmsse_level_indices,
         )
 
         rounded_predictions = np.rint(predictions).clip(min=0.0)
@@ -108,6 +119,8 @@ def main():
             Path(args.data_dir),
             data_config.prediction_length,
             compute_wrmsse=True,
+            wrmsse_context=wrmsse_context,
+            wrmsse_level_indices=wrmsse_level_indices,
         )
         
         wrmsse_results[mode] = {

@@ -40,28 +40,36 @@ def list_run_dirs(root: Path) -> list[Path]:
 def build_manifest(root: Path) -> list[dict[str, Any]]:
     manifest: list[dict[str, Any]] = []
     for run_dir in list_run_dirs(root):
-        summary_path = run_dir / "series_json" / "run_summary.json"
-        index_path = run_dir / "series_json" / "series_index.json"
-        if not summary_path.exists() or not index_path.exists():
-            continue
-        try:
-            summary = load_json(summary_path)
-            index = load_json(index_path)
-            manifest.append(
-                {
-                    "run": run_dir.name,
-                    "run_dir": run_dir.name,
-                    "series_count": index.get("series_count", 0),
-                    "available_modes": summary.get("available_modes", MODE_ORDER),
-                    "variants": summary.get("variants", VARIANTS),
-                    "aggregate_metrics": summary.get("aggregate_metrics", {}),
-                    "series_ids": index.get("series_ids", []),
-                    "summary": summary,
-                }
-            )
-        except Exception as e:
-            print(f"Warning: Failed to load manifest for {run_dir.name}: {e}")
-            continue
+        json_dirs = [d for d in run_dir.iterdir() if d.is_dir() and d.name.startswith("series_json")]
+        for json_dir in json_dirs:
+            summary_path = json_dir / "run_summary.json"
+            index_path = json_dir / "series_index.json"
+            if not summary_path.exists() or not index_path.exists():
+                continue
+            try:
+                summary = load_json(summary_path)
+                index = load_json(index_path)
+                display_name = run_dir.name
+                if json_dir.name != "series_json":
+                    suffix = json_dir.name.replace("series_json_eval_", "").replace("series_json_", "")
+                    display_name = f"{display_name} ({suffix})"
+                manifest.append(
+                    {
+                        "run": display_name,
+                        "run_id": run_dir.name,
+                        "run_dir": run_dir.name,
+                        "json_dir": json_dir.name,
+                        "series_count": index.get("series_count", 0),
+                        "available_modes": summary.get("available_modes", MODE_ORDER),
+                        "variants": summary.get("variants", VARIANTS),
+                        "aggregate_metrics": summary.get("aggregate_metrics", {}),
+                        "series_ids": index.get("series_ids", []),
+                        "summary": summary,
+                    }
+                )
+            except Exception as e:
+                print(f"Warning: Failed to load manifest for {run_dir.name}/{json_dir.name}: {e}")
+                continue
     return manifest
 
 
@@ -145,7 +153,7 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
   <div class="page">
     <div class="panel" style="margin-bottom:16px;">
       <h1>M5 Forecasts - DeepAR Experiment Viewer</h1>
-      <div class="muted">Forecasts are generated over the M5 evaluation window d1914-d1941.</div>
+      <div class="muted">Forecasts are generated over the M5 evaluation window d1914-d1941. Plot shows 28 days of history + 28 days of forecast.</div>
       <div class="chips">
         <span class="chip">Runs: {len(manifest)}</span>
         <span class="chip">Modes: {", ".join(MODE_ORDER)}</span>
@@ -427,7 +435,8 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
 
       if (runData) {{
         const runPath = runData.run_dir || runData.run;
-        const seriesPath = `${{runPath}}/series_json/series/${{encodedId}}.json`;
+        const jsonDir = runData.json_dir || "series_json";
+        const seriesPath = `${{runPath}}/${{jsonDir}}/series/${{encodedId}}.json`;
         tasks.push(fetch(seriesPath, {{ cache: "no-store" }}).then(r => r.ok ? r.json() : null).catch(() => null));
       }}
 
@@ -448,7 +457,8 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
         return;
       }}
       const runPath = runData.run_dir || runData.run;
-      const wrmssePath = `${{runPath}}/series_json/wrmsse.json`;
+      const jsonDir = runData.json_dir || "series_json";
+      const wrmssePath = `${{runPath}}/${{jsonDir}}/wrmsse.json`;
       try {{
         const resp = await fetch(wrmssePath, {{ cache: "no-store" }});
         if (resp.ok) {{
@@ -473,13 +483,21 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
       const baselineNaive = currentBaselinePayload?.baselines?.naive || {{}};
       const baselineSeasonal = currentBaselinePayload?.baselines?.seasonal_naive || {{}};
       
-      const actuals = currentPayload?.actuals || currentBaselinePayload?.actuals || [];
+      const preHoldoutActuals = currentPayload?.pre_holdout_actuals || currentBaselinePayload?.pre_holdout_actuals || [];
+      const holdoutActuals = currentPayload?.actuals || currentBaselinePayload?.actuals || [];
+      const combinedActuals = [...preHoldoutActuals, ...holdoutActuals];
+      
       const forecast = variantPayload?.forecast || [];
       const metrics = variantPayload?.metrics || {{}};
       
       const naiveForecast = baselineNaive.forecast || [];
       const seasonalForecast = baselineSeasonal.forecast || [];
-      const days = actuals.length ? actuals.map((_, idx) => idx + 1) : (forecast.length ? forecast.map((_, idx) => idx + 1) : []);
+      
+      const preHoldoutLen = preHoldoutActuals.length;
+      const actualX = combinedActuals.map((_, idx) => idx + 1);
+      const forecastX = forecast.map((_, idx) => preHoldoutLen + idx + 1);
+      const naiveX = naiveForecast.map((_, idx) => preHoldoutLen + idx + 1);
+      const seasonalX = seasonalForecast.map((_, idx) => preHoldoutLen + idx + 1);
 
       metricsEl.innerHTML = `
         ${{metricCard("MAE", metrics.mae)}}
@@ -501,19 +519,68 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
       seriesMetricsBodyEl.innerHTML = rows.join("");
 
       const traces = [];
-      if (actuals.length) {{
-        traces.push({{ x: days, y: actuals, type: "scatter", mode: "lines+markers", name: "Actual", line: {{ color: "#111827", width: 2 }} }});
+      if (combinedActuals.length) {{
+        traces.push({{ 
+          x: actualX, 
+          y: combinedActuals, 
+          type: "scatter", 
+          mode: "lines+markers", 
+          name: "Actual", 
+          line: {{ color: "#111827", width: 2 }},
+          marker: {{ size: 4 }}
+        }});
       }}
 
       if (forecast.length) {{
-        traces.push({{ x: days, y: forecast, type: "scatter", mode: "lines+markers", name: "DeepAR (" + selectedMode + ")", line: {{ color: "#2563eb", width: 2 }} }});
+        traces.push({{ 
+          x: forecastX, 
+          y: forecast, 
+          type: "scatter", 
+          mode: "lines+markers", 
+          name: "DeepAR (" + selectedMode + ")", 
+          line: {{ color: "#2563eb", width: 2 }},
+          marker: {{ size: 5 }}
+        }});
       }}
 
       if (naiveForecast.length) {{
-        traces.push({{ x: days, y: naiveForecast, type: "scatter", mode: "lines+markers", name: "Naive", line: {{ color: "#dc2626", width: 2, dash: "dot" }} }});
+        traces.push({{ 
+          x: naiveX, 
+          y: naiveForecast, 
+          type: "scatter", 
+          mode: "lines+markers", 
+          name: "Naive", 
+          line: {{ color: "#dc2626", width: 2, dash: "dot" }},
+          marker: {{ size: 4 }}
+        }});
       }}
       if (seasonalForecast.length) {{
-        traces.push({{ x: days, y: seasonalForecast, type: "scatter", mode: "lines+markers", name: "Seasonal naive", line: {{ color: "#16a34a", width: 2, dash: "dash" }} }});
+        traces.push({{ 
+          x: seasonalX, 
+          y: seasonalForecast, 
+          type: "scatter", 
+          mode: "lines+markers", 
+          name: "Seasonal naive", 
+          line: {{ color: "#16a34a", width: 2, dash: "dash" }},
+          marker: {{ size: 4 }}
+        }});
+      }}
+
+      const shapes = [];
+      if (preHoldoutLen > 0) {{
+        shapes.push({{
+          type: 'line',
+          x0: preHoldoutLen + 0.5,
+          y0: 0,
+          x1: preHoldoutLen + 0.5,
+          y1: 1,
+          yref: 'paper',
+          line: {{
+            color: 'rgba(0, 0, 0, 0.3)',
+            width: 1.5,
+            dash: 'dash'
+          }}
+        }});
       }}
 
       Plotly.react("chart", traces, {{
@@ -522,8 +589,14 @@ def build_html(root: Path, manifest: list[dict[str, Any]]) -> str:
         plot_bgcolor: "#ffffff",
         showlegend: true,
         legend: {{ orientation: "h", x: 0, y: 1.08 }},
-        xaxis: {{ title: "Forecast step", gridcolor: "#e5e7eb" }},
-        yaxis: {{ title: "Units", gridcolor: "#e5e7eb" }}
+        xaxis: {{ 
+          title: "Day index", 
+          gridcolor: "#e5e7eb",
+          tickmode: "auto",
+          nticks: 20
+        }},
+        yaxis: {{ title: "Units", gridcolor: "#e5e7eb" }},
+        shapes: shapes
       }}, {{ responsive: true, displayModeBar: false }});
     }}
 
